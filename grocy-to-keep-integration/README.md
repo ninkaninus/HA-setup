@@ -1,0 +1,194 @@
+# grocy_lists — Grocy → Home Assistant shopping list
+
+Grocy's shopping list does not track min-stock state:
+`POST /stock/shoppinglist/add-missing-products` is a one-shot snapshot with no
+counterpart that removes rows once stock recovers. This worker ignores Grocy's
+shopping list entirely and treats **"products where `amount < min_stock_amount`"**
+as desired state, converging the household's Home Assistant list onto it.
+
+## Jobs
+
+| Job | Cadence | Writes to |
+|---|---|---|
+| `sync` | every ~15 min | `todo.indkob` — the **shared** household shopping list |
+| `analyse` | weekly | `todo.grocy_forslag` — suggested `min_stock_amount` per product |
+
+Grocy is written to **only** when a suggestion is ticked. Deriving a suggestion
+never changes Grocy by itself.
+
+Google Keep support was removed: the account is in Google's Advanced Protection
+Program, which permanently disables the App Passwords `gkeepapi` needs. The
+household uses the HA list and the Companion app's to-do widget instead.
+
+**Setup instructions — the phone widget and the unRAID cron — are in [SETUP.md](SETUP.md).**
+
+### What `analyse` considers
+
+Over `LOOKBACK_DAYS` (365) it derives a reorder point per product — mean demand
+per shopping cycle plus `SAFETY_K × σ` — for products with at least
+`MIN_EVENTS` (4) consume events. It then asks a second question: **does that
+quantity actually get eaten before it goes off?**
+
+Shelf life is *observed* per product from consume rows
+(`best_before_date - purchased_date`), because `default_best_before_days` is
+set on only 5 of 109 products. Grocy stores sentinel year-9999 dates for
+non-perishables, so anything over `SHELF_SANE_MAX_DAYS` is treated as
+"does not meaningfully expire" rather than as a real number.
+
+The verdict is driven by the per-unit fact `used_date > best_before_date` —
+what fraction of units were actually consumed past their date. Median hold time
+versus median shelf life can look fine while individual units still go off, so
+the medians only ever *explain* a flag, never raise one.
+
+| Outcome | Meaning |
+|---|---|
+| `· bruges 29d, holder 557d` | fine — used well inside its shelf life |
+| `⚠ 75% over dato` | routinely eaten past its date; suggestion capped at what fits one shelf life |
+| `⚠ holdbarhed 121d` | the minimum would cover longer than the product keeps |
+| `✗ køb v. behov` | a single unit outlives its own date at this rate — suggestion is 0, don't hold stock |
+
+Example from the live data: *Økologisk æblejuice* — 75% of units consumed after
+their best-before date, so its minimum is capped rather than raised.
+
+Flags are written at the **front** of the annotation, immediately after the
+separator. The HA todo-list card truncates each row to one line on a phone, so
+anything appended to the end is precisely what gets cut off — which was the
+warnings.
+
+## Approving a suggestion — one click
+
+The `Grocy` dashboard in Home Assistant (`/dashboard-grocy/forslag`) shows the
+suggestions as a todo list. **Ticking a row is the approval.** On its next run
+the worker reads back the completed rows, writes the suggested
+`min_stock_amount` to Grocy, and removes the row. Nothing reaches Grocy until
+you tick — up to a 15-minute delay, matching the sync cadence.
+
+The target value is parsed out of the row text, which this file owns and
+writes, so what gets applied is exactly the number that was on screen when you
+ticked it — not a value re-derived later that may have drifted. Rows carry no
+`description`: the todo card renders descriptions under every row, so stashing
+a machine-readable payload there put raw JSON on the dashboard.
+
+`apply_approved()` is the only place the worker writes to Grocy, and it runs
+**only** against `SUGGEST_LIST` — ticking something on the shopping list means
+"bought it", never "change Grocy".
+
+## Run
+
+Locally, against the live Grocy and HA:
+
+```bash
+cp .env.example .env      # fill in GROCY_API_KEY and HA_TOKEN
+docker build -t grocy-lists .
+
+# always do this first after any config change
+docker run --rm --env-file .env grocy-lists sync --dry-run
+
+docker run --rm --env-file .env grocy-lists sync
+```
+
+On unRAID nothing is built by hand: CI publishes
+`ghcr.io/ninkaninus/ha-setup/grocy-lists:sha-<commit>` and a deploy agent pulls
+it. See [`../deploy/UNRAID.md`](../deploy/UNRAID.md).
+
+## Tests
+
+```bash
+pip install -r requirements.txt pytest
+pytest tests -q
+```
+
+They cover the pure parts — formatting, row ownership, the reconcile plan and
+the suggestion round-trip — because that is where a one-character slip starts
+deleting hand-added rows on a 15-minute timer. They are also the CI gate: if
+they fail, no image is published and the server has nothing to deploy.
+
+`--dry-run` prints the full add/rename/remove plan and writes nothing.
+
+The worker is **stateless** — no volume needed. All state lives in Grocy and
+Home Assistant.
+
+Exit codes: `0` success · `1` fatal (HTTP, network, unexpected API shape).
+
+## Scheduling — unRAID User Scripts
+
+`sync` every 15 minutes, `analyse` Mondays at 06:00. The scripts in `deploy/`
+are thin wrappers around `../deploy/run-unit.sh`, which runs whichever image
+version the deploy agent last verified — see
+[`../deploy/UNRAID.md`](../deploy/UNRAID.md) and [SETUP.md](SETUP.md) part 2.
+
+Do *not* also drive it from an HA `shell_command` — two schedulers on one
+worker is how you get overlapping runs.
+
+## Invariants — do not break these
+
+- **The shopping list is SHARED, not owned.** The worker only ever touches rows
+  matching its own shape (`name — have/min unit` for stock rows,
+  `... min N → M ...` for suggestions). Everything else is invisible to the
+  reconciler: never renamed, never removed. This is what lets the household add
+  their own items to the same list.
+- **Product name is the join key**, stripped of surrounding whitespace.
+  `key_of()` splits on `SEP` (`" — "`); a product name containing that exact
+  sequence breaks the key, and the script warns on stderr if one appears.
+- **Checked items count as present.** `ha_items()` requests both statuses. If
+  she ticks something off before the purchase is booked, re-adding it would be
+  the automation arguing with her.
+- **Rename in place, never delete-and-re-add.** Re-adding sends the row to the
+  bottom of her list on every stock change, and loses its ticked state.
+- **Adds land before removes.** `reconcile()` computes the whole plan first,
+  then applies adds and renames, and only then removals — so a mid-run failure
+  leaves extra items rather than missing ones.
+- **Only ticking writes to Grocy.** Deriving a suggestion never changes Grocy;
+  `apply_approved()` is the single write path and runs only against the
+  suggestions list.
+
+## Do not
+
+- Do not add quantity prefixes to item text (`2 x Mælk`). Quantity in the
+  identity string means every partial consumption churns the list.
+- Do not use Grocy's own shopping list as an intermediate.
+
+## Verification status (2026-08-12)
+
+Verified against the live Grocy 4.6.0 and Home Assistant 2026.6.3. Full record
+is in the module docstring of `grocy_lists.py`. Headlines:
+
+- All Grocy field names in the draft were **correct**, including that spoilage
+  is a `spoiled` 0/1 flag on `consume` rows rather than its own
+  `transaction_type`.
+- `stock_log` server-side filtering and `limit`/`offset` paging both verified:
+  7 pages × 50 returned 322 unique ids, exactly matching the unpaged count.
+- **Fixed a churn bug.** 48 of 109 product names carry trailing whitespace. The
+  desired-set key used the raw name while `reconcile()` derived its key with
+  `.strip()`, so they never matched — every run re-added the item and removed
+  the old row, forever — a visible flicker on her list every 15 minutes.
+  Now stripped at catalogue time; runs 2 and 3 are verified no-ops.
+- Grocy is behind **Cloudflare**, which 403s a `Python-urllib` user agent.
+  `requests` is fine, and the script now sends an explicit UA so this cannot
+  resurface as a mystery 403.
+- `todo.get_items` returns completed items when `status` is omitted, despite
+  `services.yaml` declaring a `needs_action` default — those defaults are UI
+  hints, not applied to API calls. Passed explicitly anyway.
+
+## Caveat worth stating plainly
+
+All of this is downstream of purchases actually being booked into Grocy. If
+groceries enter the house unrecorded, stock stays below minimum, the item never
+leaves the list, and the household learns to ignore it. Barcode purchase flow on
+a phone is what makes the model hold — the fix for a noisy first few weeks is
+process, not code.
+
+Related: with 60 consume rows across 22 products in the last 90 days, only 5
+products currently clear `MIN_EVENTS=4`, yielding 3 suggestions. `analyse` gets
+more useful as consumption booking becomes habitual.
+
+## Whole numbers only
+
+Suggested minimums are always integers, rounded **up** — you cannot keep 0,3 of
+a packet on a shelf, and up is the safe direction for a minimum. This also cut
+the suggestion list from 22 rows to 13, because every "↓ 0,4" collapsed to 1,
+which usually equals the current minimum and so stops being a suggestion at all.
+
+A minimum that is *already* a decimal is surfaced regardless of
+`CHANGE_THRESHOLD`. Without that, a product sitting at 1,7 is only 0,3 away
+from 2, would never clear the 25% bar, and would keep its decimal forever.

@@ -1,0 +1,16 @@
+# Pinned exactly so a rebuild is reproducible.
+#
+# Verified working against Grocy 4.6.0 and Home Assistant 2026.6.3 on
+# 2026-08-12. The API surface this pin guarantees is recorded in the
+# verification block at the top of grocy_lists.py.
+#
+# gkeepapi was removed along with Google Keep support — the account is in
+# Google's Advanced Protection Program, which permanently disables the App
+# Passwords that gkeepapi needs for a master token. The household uses the
+# Home Assistant list instead.
+requests==2.34.2
+
+# transitive, pinned
+urllib3==2.7.0
+certifi==2026.7.22
+idna==3.18

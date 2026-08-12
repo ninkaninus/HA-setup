@@ -1,0 +1,109 @@
+# The CI half of auto-deploy. See deploy/UNRAID.md for the whole picture.
+#
+# Push to main -> tests run -> image is built and published to GHCR, tagged
+# with the commit SHA. The server polls and pulls it (pull-based, like Argo
+# CD): GitHub has NO access to the server, no SSH keys, no inbound webhooks.
+# If a test fails, no image is published and the server has nothing to roll
+# out — it just keeps running the last commit that passed.
+
+name: Test, build and publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r grocy-to-keep-integration/requirements.txt pytest
+      - run: pytest grocy-to-keep-integration/tests -q
+
+  # The safety net for a public repo: if a real secret is ever committed, it
+  # fails here instead of on GitHub. .gitignore alone stops honest mistakes;
+  # this also catches `git add -f` and files added before they were ignored.
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: No secrets or databases in the tree
+        run: |
+          fail=0
+
+          # Files that must never be tracked, however they got there.
+          while read -r f; do
+            case "$f" in
+              *.env.example) continue ;;
+              *.env|.env|*/.env) ;;
+              .claude/settings.local.json|*/.claude/settings.local.json) ;;
+              *.db|*.sqlite|*.sqlite3) ;;
+              *) continue ;;
+            esac
+            echo "::error file=$f::$f is committed — it must stay gitignored"
+            fail=1
+          done < <(git ls-files)
+
+          # Credential-shaped strings anywhere in the tracked tree. The
+          # exclusions are this workflow itself (which contains the patterns)
+          # and lockfile-style hashes.
+          if git grep -nIE 'gh[pousr]_[A-Za-z0-9]{30,}|eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{10,}' \
+               -- . ':(exclude).github/workflows/deploy.yml'; then
+            echo "::error::a token-shaped string is committed"
+            fail=1
+          fi
+
+          # A filled-in credential in any committed env file.
+          if git grep -nIE '^(GROCY_API_KEY|HA_TOKEN|TUNNEL_TOKEN|.*PASSWORD)=.+' \
+               -- '*.env.example' '*.env'; then
+            echo "::error::an env file carries a real value, not a blank"
+            fail=1
+          fi
+
+          exit $fail
+
+  build-and-publish:
+    # Only real pushes to main publish — pull requests are just tested.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, hygiene]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # GITHUB_TOKEN may write to GHCR; no secrets of our own.
+    steps:
+      - uses: actions/checkout@v5
+
+      # GHCR image names must be lowercase and this repo is "HA-setup", so
+      # ${{ github.repository }} cannot be used raw — it produces an invalid
+      # tag and the push fails with a confusing 400.
+      - id: img
+        run: echo "repo=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # EVERY commit on main publishes an image, even one that only touches
+      # docs — the agent deploys by commit SHA and waits forever for an image
+      # that never gets built. Do not add a `paths:` filter to this workflow
+      # or to this step; the layer cache is what keeps it cheap, not skipping.
+      - uses: docker/build-push-action@v6
+        with:
+          context: grocy-to-keep-integration
+          push: true
+          tags: |
+            ghcr.io/${{ steps.img.outputs.repo }}/grocy-lists:sha-${{ github.sha }}
+            ghcr.io/${{ steps.img.outputs.repo }}/grocy-lists:latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

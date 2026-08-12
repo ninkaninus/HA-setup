@@ -1,0 +1,27 @@
+# Secrets and machine-local state. This repo is PUBLIC — everything here is
+# enforced a second time by the hygiene job in .github/workflows/deploy.yml,
+# because a .gitignore only protects you until someone runs `git add -f`.
+
+# Real credentials. Only .env.example is ever committed.
+.env
+*.env
+!.env.example
+!*.env.example
+
+# Holds the ha-mcp private URL slug, which is a bearer credential.
+.claude/settings.local.json
+
+# Databases — never in git.
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Editor/OS noise
+.DS_Store
+*.swp

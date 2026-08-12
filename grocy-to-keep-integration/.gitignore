@@ -1,0 +1,5 @@
+.env
+data/
+keep_state.json
+__pycache__/
+*.pyc
