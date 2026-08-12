@@ -120,23 +120,30 @@ chmod 600 secrets/grocy-lists.env
 **Check:** `grep -c . /mnt/user/appdata/ha-setup/secrets/grocy-lists.env`
 returns a number, and `GROCY_API_KEY=` / `HA_TOKEN=` are not blank.
 
-### Step 3 — the GHCR package must be public
+### Step 3 — confirm the GHCR package is public
 
-A package built by Actions is **private by default, even in a public repo**.
-Leave it private and the server gets `denied` on every pull, forever.
+It already is: `ha-setup/grocy-lists` was published public by the first CI run,
+inheriting the repo's visibility. Verified 2026-08-12 by fetching its manifest
+anonymously — which is exactly what the box does, holding no credentials.
 
-1. Push to main and let the workflow finish green (Actions tab → "Test, build
-   and publish").
-2. Go to `https://github.com/users/ninkaninus/packages/container/package/ha-setup%2Fgrocy-lists`
-   — packages are **user-scoped**, so they live under your profile, not inside
-   the repo.
-3. **Package settings** (gear, bottom right) → **Danger Zone → Change package
-   visibility → Public** → type the package name → confirm.
+Worth confirming rather than assuming, because a private package fails at the
+last possible moment: the agent pulls, gets `denied`, and reports "image not
+published yet" forever.
 
-The package page can lag behind in the UI. The authoritative answer is a
-`docker pull` from the server.
+```bash
+gh api /user/packages?package_type=container \
+  --jq '.[] | select(.name=="ha-setup/grocy-lists") | .visibility'   # -> public
+```
 
-**Check** (from the unRAID terminal):
+If it ever reads `private` — GHCR's default for packages *not* linked to a
+public repo — packages are **user-scoped**, so the setting lives under your
+profile, not inside the repo:
+`https://github.com/users/ninkaninus/packages/container/package/ha-setup%2Fgrocy-lists`
+→ **Package settings** (gear, bottom right) → **Danger Zone → Change package
+visibility → Public**.
+
+**Check** (from the unRAID terminal — the authoritative answer, since the
+package page can lag behind in the UI):
 
 ```bash
 docker pull ghcr.io/ninkaninus/ha-setup/grocy-lists:latest
