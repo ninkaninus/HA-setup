@@ -96,6 +96,7 @@ import os
 import re
 import statistics
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -179,12 +180,21 @@ PRICE_LOOKBACK_DAYS = int(os.environ.get("PRICE_LOOKBACK_DAYS", 1825))
 # the purchase-history backfill. Free key from developer.sallinggroup.dev,
 # scope "Products EAN" (GET /v2/products/{ean}).
 SALLING_TOKEN = os.environ.get("SALLING_TOKEN", "")
+# Prices are per physical store, so the lookup needs one. A UUID from the
+# Stores API — the store you actually shop in, since it decides both the price
+# and whether the product is stocked at all. Without it the Salling half is
+# skipped.
+SALLING_STORE_ID = os.environ.get("SALLING_STORE_ID", "")
 # One request per barcode, and the quota is 100 PER DAY. 90 leaves headroom for
 # a manual run on the same day without tripping it. With ~128 unpriced barcodes
 # the first pass therefore takes two runs, which is why this is scheduled
 # weekly rather than monthly: monthly would take two months to converge for no
 # gain. A 429 aborts the rest of the run either way.
 SALLING_MAX_LOOKUPS = int(os.environ.get("SALLING_MAX_LOOKUPS", 90))
+# Seconds between lookups. There is a burst limit on top of the daily quota —
+# firing a dozen requests back to back gets 429s regardless of how much of the
+# daily allowance is left. Measured while developing this, not guessed.
+SALLING_DELAY = float(os.environ.get("SALLING_DELAY", 1.5))
 
 USER_AGENT = os.environ.get("USER_AGENT", "grocy-lists/1.0")
 
@@ -765,64 +775,58 @@ def _as_price(value):
     return price if price > 0 else None
 
 
-# The response shape of /v2/products/{ean} is not published, so rather than
-# hard-coding one guess we look for a price under any of the names such an API
-# plausibly uses, at the top level or one level in. Finding nothing is a safe
-# outcome — the barcode is simply skipped.
-PRICE_KEYS = ("price", "salesPrice", "currentPrice", "retailPrice",
-              "unitPrice", "amount")
-PRICE_HOLDERS = ("product", "data", "result", "item")
-
-
 def extract_price(payload):
-    """Pull a price out of a Salling product response.
+    """The shelf price from a /v2/products/{ean} response, or None.
 
-    Deliberately shape-tolerant. This runs unattended and its input is an API
-    whose schema this code has never seen — the first real response is the
-    only documentation there is. Returning None on anything unfamiliar keeps a
-    schema change from turning into a wrong price in Grocy."""
+    Verified against the live API on 2026-08-13. The shape is:
+
+        {"instore": {"ean": "5710405090951", "name": "KOKOSMÆLK",
+                     "description": "ASIA KITCHEN", "price": 9.5,
+                     "contents": 400, "contentsUnit": "ml",
+                     "unit": "l", "unitPrice": 23.75},
+         "webshop": null}
+
+    `unitPrice` is ignored ON PURPOSE. It is the comparison price per litre or
+    kilo — 23,75 per litre for a tin of coconut milk that costs 9,50 — so
+    reaching for it would overstate every product with a unit smaller than its
+    comparison unit. Only `price` is the shelf price.
+
+    instore first: this fills in what a barcode scan at the till should show.
+    webshop is the fallback for products the store lists online only.
+
+    Anything else returns None, which skips the barcode. A schema change must
+    degrade to "no price" rather than to a wrong one — nobody re-checks a
+    number that is already filled in."""
     if not isinstance(payload, dict):
         return None
-
-    for key in PRICE_KEYS:
-        price = _as_price(payload.get(key))
-        if price:
-            return price
-
-    for holder in PRICE_HOLDERS:
-        sub = payload.get(holder)
-        if isinstance(sub, dict):
-            for key in PRICE_KEYS:
-                price = _as_price(sub.get(key))
-                if price:
-                    return price
-
-    prices = payload.get("prices")
-    if isinstance(prices, list):
-        for entry in prices:
-            if isinstance(entry, dict):
-                for key in PRICE_KEYS:
-                    price = _as_price(entry.get(key))
-                    if price:
-                        return price
-    return None
+    for section in ("instore", "webshop"):
+        block = payload.get(section)
+        if isinstance(block, dict):
+            price = _as_price(block.get("price"))
+            if price:
+                return price
+    # A flatter shape, should they ever simplify it.
+    return _as_price(payload.get("price"))
 
 
 def salling_price(ean):
-    """Current shelf price for one barcode, or None.
+    """Shelf price for one barcode at SALLING_STORE_ID, or None.
 
-    404 is the normal case, not an error: it means Salling does not sell that
-    product. Anything else unexpected also yields None — an opportunistic
+    404 is the normal case, not an error: it means that store does not stock
+    the product. Anything else unexpected also yields None — an opportunistic
     source must never be able to fail the job."""
     r = SESSION.get(
         f"https://api.sallinggroup.com/v2/products/{ean}",
         headers={"Authorization": f"Bearer {SALLING_TOKEN}"},
+        params={"storeId": SALLING_STORE_ID},
         timeout=30,
     )
     if r.status_code == 404:
         return None
     if r.status_code == 429:
-        raise RuntimeError("rate limited")
+        # Not retried: there is a daily quota behind this, and burning it on
+        # retries would cost the next run rather than saving this one.
+        raise RuntimeError("rate limited (429) — stopping for this run")
     r.raise_for_status()
     try:
         return extract_price(r.json())
@@ -862,7 +866,10 @@ def job_prices():
         # Salling is asked only about barcodes your own history cannot answer,
         # and only up to a cap: this is a free API offered for non-commercial
         # use, and a bug that turned it into a tight loop would be abusing it.
-        if price is None and SALLING_TOKEN and code and looked_up < SALLING_MAX_LOOKUPS:
+        if (price is None and SALLING_TOKEN and SALLING_STORE_ID and code
+                and looked_up < SALLING_MAX_LOOKUPS):
+            if looked_up:
+                time.sleep(SALLING_DELAY)   # burst limit, see SALLING_DELAY
             try:
                 price = salling_price(code)
                 looked_up += 1

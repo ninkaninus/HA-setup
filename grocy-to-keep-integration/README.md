@@ -102,12 +102,22 @@ at the till. `prices` fills the empty ones from two **exact-keyed** sources:
 | Source | Key | Coverage |
 |---|---|---|
 | Your own purchase history | product id | 31 barcodes across 17 products |
-| Salling Products EAN API | EAN | whatever Netto/Føtex/Bilka sell |
+| Salling Products EAN API | EAN | ~40% of the rest, measured at Bilka Tilst |
 
-`GET /v2/products/{ean}` — barcode in, shelf price out, so a price can never be
-attached to the wrong product. Salling is asked only about barcodes your own
-history can't answer. No token, a 404 (Salling doesn't sell it), or an API
-failure just skips that barcode.
+`GET /v2/products/{ean}?storeId=<uuid>` — barcode in, shelf price out, so a
+price can never be attached to the wrong product. Salling is asked only about
+barcodes your own history can't answer. No token, no store id, a 404 (that
+store doesn't stock it), or an API failure just skips that barcode.
+
+**Prices are per store**, so `SALLING_STORE_ID` decides both the price and the
+hit rate. Measured against Bilka Tilst — the widest range in the group — 6 of
+15 plausible barcodes returned a price. REMA and Coop private label (26 of the
+92) can never hit, being other chains' brands.
+
+The response nests the price under `instore`, alongside a `unitPrice` that is
+the comparison price per litre or kilo: 23,75/l for a tin of coconut milk that
+costs 9,50. Only `price` is read — see `extract_price`, which is pinned to the
+verified shape by tests.
 
 **The quota shapes the schedule.** 100 requests per day, one per barcode, so
 `SALLING_MAX_LOOKUPS` is 90 and the job runs weekly: two passes to cover ~128

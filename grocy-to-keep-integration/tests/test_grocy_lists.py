@@ -277,47 +277,64 @@ def test_purchases_without_a_usable_price_are_ignored(row):
     assert g.latest_purchase_price([row]) == {}
 
 
-# Salling's /v2/products/{ean} response shape is not published, so extract_price
-# is written to tolerate several plausible schemas. These cases pin that
-# tolerance down — and, more importantly, pin down that anything it does not
-# recognise yields None rather than a guess.
+# extract_price is pinned to the REAL response shape, captured from the live
+# API on 2026-08-13. The first version of this code guessed the schema and
+# would have returned None for every product — these tests exist so that can
+# never silently happen again.
+
+LIVE_RESPONSE = {
+    "instore": {
+        "contents": 400, "contentsUnit": "ml", "description": "ASIA KITCHEN",
+        "ean": "5710405090951", "name": "KOKOSMÆLK", "price": 9.5,
+        "unit": "l", "unitPrice": 23.75,
+    },
+    "webshop": None,
+}
 
 
-@pytest.mark.parametrize("payload,expected", [
-    ({"ean": "1", "price": 19.95}, 19.95),
-    ({"ean": "1", "salesPrice": 19.95}, 19.95),
-    ({"ean": "1", "currentPrice": 19.95}, 19.95),
-    ({"product": {"ean": "1", "price": 19.95}}, 19.95),
-    ({"data": {"price": 19.95}}, 19.95),
-    ({"prices": [{"price": 19.95}]}, 19.95),
-    ({"ean": "1", "price": "19.95"}, 19.95),          # numeric string
-])
-def test_a_price_is_found_in_any_plausible_shape(payload, expected):
-    assert g.extract_price(payload) == expected
+def test_the_live_response_shape_yields_the_shelf_price():
+    assert g.extract_price(LIVE_RESPONSE) == 9.5
+
+
+def test_the_comparison_unit_price_is_never_used():
+    """unitPrice is per litre or kilo — 23,75/l for a 9,50 tin. Reaching for
+    it would overstate every product sold in less than its comparison unit."""
+    assert g.extract_price({"instore": {"unitPrice": 23.75}}) is None
+
+
+def test_webshop_is_the_fallback_when_there_is_no_instore_price():
+    payload = {"instore": None, "webshop": {"ean": "1", "price": 12.0}}
+    assert g.extract_price(payload) == 12.0
+
+
+def test_instore_wins_over_webshop():
+    """The point of this field is what the till shows when the barcode is
+    scanned, which is the in-store price."""
+    payload = {"instore": {"price": 9.5}, "webshop": {"price": 12.0}}
+    assert g.extract_price(payload) == 9.5
 
 
 @pytest.mark.parametrize("payload", [
     {}, [], None, "nope", 42,
-    {"ean": "1"},                                     # no price at all
-    {"ean": "1", "price": None},
-    {"ean": "1", "price": 0},
-    {"ean": "1", "price": -5},
-    {"ean": "1", "price": "gratis"},
-    {"product": None},
-    {"prices": []},
-    {"prices": ["nonsense"]},
-    {"description": "Tun i vand", "unrelated": {"nested": 12}},
+    {"instore": None, "webshop": None},          # known at Salling, no price
+    {"instore": {"ean": "1", "name": "X"}},      # no price field
+    {"instore": {"price": None}},
+    {"instore": {"price": 0}},
+    {"instore": {"price": -5}},
+    {"instore": {"price": "gratis"}},
+    {"instore": "not a dict"},
+    {"unexpected": {"price": 9.5}},              # a shape we do not recognise
 ])
 def test_an_unrecognised_shape_yields_no_price_rather_than_a_guess(payload):
     """A schema change must degrade to "skip this barcode", never to a wrong
-    number. Nobody re-checks a price that is already filled in."""
+    number in Grocy."""
     assert g.extract_price(payload) is None
 
 
 def test_a_zero_price_is_not_treated_as_a_price():
-    """Grocy reads 0 as "unset", so writing 0 would be a no-op dressed up as a
-    decision — and would stop the barcode being retried next run."""
-    assert g.extract_price({"price": 0}) is None
+    """Grocy reads 0 as "unset", so writing it would be a no-op dressed up as
+    a decision — and would stop the barcode being retried next run."""
+    assert g.extract_price({"instore": {"price": 0}}) is None
 
 
 # --------------------------------------------------------------- reconcile
