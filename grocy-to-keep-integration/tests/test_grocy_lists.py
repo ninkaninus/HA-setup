@@ -250,6 +250,82 @@ def test_a_product_missing_from_the_catalogue_is_skipped(monkeypatch):
     assert g.apply_shelf_defaults({}, {99: [30, 30, 31, 29]}) == 0
 
 
+# ------------------------------------------------------------ barcode prices
+
+
+def test_the_most_recent_priced_purchase_wins():
+    """A price is a pre-fill for the next purchase, so the last thing it cost
+    beats an average dragged down by two-year-old prices."""
+    rows = [
+        {"product_id": "1", "price": "12.50", "row_created_timestamp": "2026-01-05 10:00:00"},
+        {"product_id": "1", "price": "14.95", "row_created_timestamp": "2026-06-05 10:00:00"},
+        {"product_id": "2", "price": "8.00", "row_created_timestamp": "2026-03-05 10:00:00"},
+    ]
+    assert g.latest_purchase_price(rows) == {1: 14.95, 2: 8.00}
+
+
+@pytest.mark.parametrize("row", [
+    {"product_id": "1", "price": None, "row_created_timestamp": "2026-01-05 10:00:00"},
+    {"product_id": "1", "price": "", "row_created_timestamp": "2026-01-05 10:00:00"},
+    {"product_id": "1", "price": "0", "row_created_timestamp": "2026-01-05 10:00:00"},
+    {"product_id": "1", "price": "gratis", "row_created_timestamp": "2026-01-05 10:00:00"},
+    {"price": "5.00", "row_created_timestamp": "2026-01-05 10:00:00"},
+])
+def test_purchases_without_a_usable_price_are_ignored(row):
+    """Most purchases are booked without a price — 217 of 279 — so the empty
+    cases are the common path, not the edge case."""
+    assert g.latest_purchase_price([row]) == {}
+
+
+def test_salling_yields_the_original_price_not_the_markdown():
+    """The markdown is what a nearly-expired unit costs today. Writing that in
+    would make the whole shelf look cheaper than it is."""
+    payload = [{
+        "store": {"name": "Netto Testby"},
+        "clearances": [{
+            "offer": {"ean": "5705830017093", "originalPrice": 19.95,
+                      "newPrice": 7.00, "currency": "DKK"},
+            "product": {"ean": "5705830017093", "description": "Tun i vand"},
+        }],
+    }]
+    assert g.parse_salling(payload) == {"5705830017093": 19.95}
+
+
+def test_the_same_product_in_several_stores_is_reduced_to_the_median():
+    payload = [
+        {"clearances": [{"offer": {"ean": "1", "originalPrice": 10.0}}]},
+        {"clearances": [{"offer": {"ean": "1", "originalPrice": 12.0}}]},
+        {"clearances": [{"offer": {"ean": "1", "originalPrice": 11.0}}]},
+    ]
+    assert g.parse_salling(payload) == {"1": 11.0}
+
+
+def test_the_ean_falls_back_to_the_product_when_the_offer_lacks_one():
+    payload = [{"clearances": [
+        {"offer": {"originalPrice": 5.0}, "product": {"ean": "5705830000001"}},
+    ]}]
+    assert g.parse_salling(payload) == {"5705830000001": 5.0}
+
+
+@pytest.mark.parametrize("payload", [
+    [],
+    {},
+    {"stores": []},
+    [{"clearances": []}],
+    [{"clearances": [{"offer": {"ean": "1"}}]}],                  # no price
+    [{"clearances": [{"offer": {"ean": "", "originalPrice": 5}}]}],  # no ean
+    [{"clearances": [{"offer": {"ean": "1", "originalPrice": "n/a"}}]}],
+    [{"clearances": [{"offer": {"ean": "1", "originalPrice": 0}}]}],
+    [{"clearances": ["nonsense"]}],
+    ["nonsense"],
+    {"unexpected": "shape"},
+])
+def test_an_unrecognised_salling_shape_yields_nothing_rather_than_guesses(payload):
+    """This runs unattended against a loosely documented response. Returning
+    nothing is always safe; guessing writes a wrong price into Grocy."""
+    assert g.parse_salling(payload) == {}
+
+
 # --------------------------------------------------------------- reconcile
 
 

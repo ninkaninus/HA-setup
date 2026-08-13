@@ -12,6 +12,7 @@ as desired state, converging the household's Home Assistant list onto it.
 |---|---|---|
 | `sync` | every ~15 min | `todo.indkob` — the **shared** household shopping list |
 | `analyse` | weekly | `todo.grocy_forslag` — suggested `min_stock_amount` per product; and `default_best_before_days` in Grocy |
+| `prices` | daily | `product_barcodes.last_price` in Grocy, where it is empty |
 
 `min_stock_amount` is written to Grocy **only** when a suggestion is ticked.
 Deriving a suggestion never changes Grocy by itself.
@@ -91,6 +92,42 @@ the most recent few.
 
 Set `SET_DEFAULT_EXPIRY=0` to turn it off. `analyse --dry-run` prints every
 change it would make.
+
+## Barcode prices
+
+Grocy pre-fills the price at purchase from `product_barcodes.last_price`. All
+159 barcodes had it empty, so even prices typed by hand were never coming back
+at the till. `prices` fills the empty ones from two **exact-keyed** sources:
+
+| Source | Key | Coverage |
+|---|---|---|
+| Your own purchase history | product id | 31 barcodes across 17 products |
+| Salling Anti Food Waste | EAN | whatever is marked down near `SALLING_ZIP` today |
+
+Salling's feed publishes an EAN and the **original** shelf price alongside each
+markdown. The original is what gets used — the markdown is what a nearly-expired
+unit costs today, and writing that in would make the whole shelf look cheap.
+No token, no `SALLING_ZIP`, or an API failure just skips that half.
+
+It only ever fills **empty** prices, so it cannot overwrite what the household
+typed, and it is safe to run repeatedly.
+
+### Why there is no name matching here
+
+REMA publishes a full catalogue — 3850 products, live shelf prices,
+unauthenticated — but **no GTIN and no server-side search**, so the only way in
+is matching product names. Measured against this Grocy: about 11 of 24 REMA
+private-label products matched correctly, and the *wrong* answers scored as
+high as the right ones. `Chokolade mysli` matched M&M'S chocolate at 46,95;
+`Ferskner i lage` matched a bag of bread.
+
+Constraining on brand and size (from Open Food Facts) fixed the scoring — but
+OFF has no record for **82 of the 92** unpriced barcodes, so there is nothing
+to constrain with. Two products out of 92 survived end to end.
+
+That is the whole reason this job is exact-key only. A wrong expiry date gets
+caught, because the package is read at purchase. A wrong price is invisible —
+nobody re-checks a number that is already filled in.
 
 ## Approving a suggestion — one click
 

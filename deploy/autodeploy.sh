@@ -9,7 +9,7 @@
 #   1. Fetch origin/main. New commit? Otherwise stop.
 #   2. Does ghcr.io/...:sha-<commit> exist? Otherwise stop — that means CI is
 #      not finished, or the tests failed. No green tests, no deploy.
-#   3. Smoke-test the new image against the REAL config: `sync --dry-run`
+#   3. Smoke-test the new image against the REAL config: `all --dry-run`
 #      reads Grocy and Home Assistant, prints the plan and writes nothing.
 #   4. Only if that exits 0: git reset --hard and pin the new image ref.
 #
@@ -48,7 +48,7 @@ SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-300}"
 # unit's env file is $SECRETS_DIR/<name>.env and its pinned image ref is
 # written to $STATE_DIR/<name>.image, which is what the cron scripts read.
 UNITS=(
-    "grocy-lists|both --dry-run"
+    "grocy-lists|all --dry-run"
 )
 
 # Repo files on unRAID are typically owned by root or nobody; without this
@@ -89,7 +89,7 @@ env_file_for() {
 # deploy — and a failure here is exactly the class of breakage that would
 # otherwise land silently on her shopping list.
 #
-# `both`, not `sync`: analyse writes default_best_before_days to Grocy without
+# `all`, not `sync`: analyse and prices both write to Grocy without
 # any approval step, which makes it the least supervised thing here and so the
 # most worth exercising before promotion. It costs one extra stock_log fetch.
 smoke() {

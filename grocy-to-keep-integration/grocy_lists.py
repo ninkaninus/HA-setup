@@ -156,6 +156,30 @@ SHELF_REL_SPREAD = float(os.environ.get("SHELF_REL_SPREAD", 0.4))
 # the badly wrong ones are worth overwriting.
 EXPIRY_CHANGE_THRESHOLD = float(os.environ.get("EXPIRY_CHANGE_THRESHOLD", 0.3))
 
+# --- barcode prices ---------------------------------------------------------
+# Grocy pre-fills the price at purchase from product_barcodes.last_price, and
+# all 159 barcodes had it empty — so even prices typed by hand were not coming
+# back. Two sources, both EXACT; there is no name matching anywhere here.
+#
+#   1. Own purchase history. The price last typed for that product. Free,
+#      exact, and the reason this job is worth running even with no token.
+#   2. Salling's Anti Food Waste feed, which carries an EAN and the ORIGINAL
+#      shelf price alongside each markdown. Matched on the barcode itself, so
+#      it cannot attach a price to the wrong product.
+#
+# Deliberately NOT here: matching REMA's catalogue by product name. It has
+# 3850 live prices but publishes no barcode, and name matching put a bar of
+# soap's price on the lasagne sheets. A wrong price is invisible — nobody
+# re-checks a number that is already filled in — so only exact keys are used.
+SET_BARCODE_PRICES = os.environ.get("SET_BARCODE_PRICES", "1") == "1"
+# How far back to look for a price you typed yourself. Long: a price from two
+# years ago beats no price at all, and it is only ever a pre-fill.
+PRICE_LOOKBACK_DAYS = int(os.environ.get("PRICE_LOOKBACK_DAYS", 1825))
+# Optional. Without a token the Salling half is skipped and the job still does
+# the purchase-history backfill. Free key from developer.sallinggroup.dev.
+SALLING_TOKEN = os.environ.get("SALLING_TOKEN", "")
+SALLING_ZIP = os.environ.get("SALLING_ZIP", "")
+
 USER_AGENT = os.environ.get("USER_AGENT", "grocy-lists/1.0")
 
 SEP = " — "  # separates product name from the level annotation
@@ -452,8 +476,8 @@ def job_sync():
 # ------------------------------------------------------------- job: analyse
 
 
-def consumption_log(days):
-    """All non-undone consume rows in the window, paginated.
+def stock_log_rows(transaction_type, days):
+    """All non-undone rows of one transaction type in the window, paginated.
     Server-side filtering and paging both verified against Grocy 4.6.0."""
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     rows, offset, page = [], 0, 500
@@ -462,7 +486,7 @@ def consumption_log(days):
             "objects/stock_log",
             **{
                 "query[]": [
-                    "transaction_type=consume",
+                    f"transaction_type={transaction_type}",
                     "undone=0",
                     f"row_created_timestamp>{cutoff}",
                 ],
@@ -474,6 +498,10 @@ def consumption_log(days):
         if len(batch) < page:
             return rows
         offset += page
+
+
+def consumption_log(days):
+    return stock_log_rows("consume", days)
 
 
 def _date(s):
@@ -698,25 +726,161 @@ def job_analyse():
     return 0
 
 
+# ---------------------------------------------------------------- job: prices
+
+
+def latest_purchase_price(rows):
+    """{product_id: price} from the most recent purchase that carried one.
+
+    Most recent rather than average: a price is a pre-fill for the next
+    purchase, so the last thing it actually cost beats a mean dragged down by
+    what it cost two years ago."""
+    best = {}
+    for r in rows:
+        try:
+            price = float(r.get("price"))
+            pid = int(r["product_id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if price <= 0:
+            continue
+        ts = r.get("row_created_timestamp") or ""
+        if pid not in best or ts > best[pid][0]:
+            best[pid] = (ts, price)
+    return {pid: price for pid, (_, price) in best.items()}
+
+
+def parse_salling(payload):
+    """{barcode: original shelf price} from the Anti Food Waste response.
+
+    ORIGINAL price, never the markdown — the markdown is what a nearly-expired
+    unit costs today, and writing that in as the product's price would make
+    everything look systematically cheap than it is.
+
+    Written defensively because this runs unattended against a response shape
+    that is only loosely documented: anything unrecognised is skipped, never
+    guessed at. Several stores report the same product, so prices are
+    collected and the median taken."""
+    seen = defaultdict(list)
+    stores = payload if isinstance(payload, list) else payload.get("stores", [])
+    if not isinstance(stores, list):
+        return {}
+    for store in stores:
+        if not isinstance(store, dict):
+            continue
+        for c in store.get("clearances") or []:
+            if not isinstance(c, dict):
+                continue
+            offer = c.get("offer") or {}
+            product = c.get("product") or {}
+            ean = str(offer.get("ean") or product.get("ean") or "").strip()
+            try:
+                price = float(offer.get("originalPrice"))
+            except (TypeError, ValueError):
+                continue
+            if ean and price > 0:
+                seen[ean].append(price)
+    return {ean: statistics.median(v) for ean, v in seen.items()}
+
+
+def salling_lookup():
+    """Ask Salling what is on clearance nearby. Failures here are not fatal:
+    it is an opportunistic extra, and the purchase-history backfill is the
+    half that always works."""
+    if not SALLING_TOKEN or not SALLING_ZIP:
+        return {}
+    try:
+        r = SESSION.get(
+            "https://api.sallinggroup.com/v1/food-waste/",
+            headers={"Authorization": f"Bearer {SALLING_TOKEN}"},
+            params={"zip": SALLING_ZIP},
+            timeout=30,
+        )
+        r.raise_for_status()
+        prices = parse_salling(r.json())
+    except requests.RequestException as e:
+        print(f"  salling lookup failed, skipping: {e}", file=sys.stderr)
+        return {}
+    except ValueError:
+        print("  salling returned unparsable JSON, skipping", file=sys.stderr)
+        return {}
+    print(f"  salling: {len(prices)} barcodes on clearance near {SALLING_ZIP}")
+    return prices
+
+
+def job_prices():
+    """Fill product_barcodes.last_price where it is empty, so a barcode scan
+    at purchase pre-fills a price.
+
+    Only ever fills EMPTY fields — a price already there was either typed by
+    the household or written by an earlier run, and neither is ours to
+    second-guess. Both sources are keyed on exact identifiers, so nothing here
+    can attach a price to the wrong product."""
+    if not SET_BARCODE_PRICES:
+        print("prices: disabled (SET_BARCODE_PRICES=0)")
+        return 0
+
+    products = product_catalogue()
+    barcodes = grocy("objects/product_barcodes")
+    own = latest_purchase_price(stock_log_rows("purchase", PRICE_LOOKBACK_DAYS))
+    external = salling_lookup()
+
+    empty = [b for b in barcodes
+             if str(b.get("last_price") or "").strip() in ("", "0", "0.0")]
+    print(f"prices: {len(empty)} of {len(barcodes)} barcodes have no price; "
+          f"{len(own)} products have one in your purchase history")
+
+    from_history = from_salling = 0
+    for b in empty:
+        pid = int(b["product_id"])
+        code = str(b.get("barcode") or "").strip()
+        price, source = own.get(pid), "purchase history"
+        if price is None:
+            price, source = external.get(code), "salling"
+        if price is None:
+            continue
+
+        name = (products.get(pid) or {}).get("name", f"product {pid}")
+        if DRY_RUN:
+            print(f"  [dry-run] would set last_price={price} on {code} "
+                  f"({name}) from {source}")
+        else:
+            grocy_put(f"objects/product_barcodes/{b['id']}",
+                      {"last_price": price})
+            print(f"  set last_price={price} on {code} ({name}) from {source}")
+        if source == "salling":
+            from_salling += 1
+        else:
+            from_history += 1
+
+    print(f"  filled {from_history} from purchase history, "
+          f"{from_salling} from salling")
+    return 0
+
+
 # ---------------------------------------------------------------- entry
 
 
 def main():
     global DRY_RUN
     ap = argparse.ArgumentParser()
-    ap.add_argument("job", choices=["sync", "analyse", "both"])
+    # "both" predates the prices job and is kept so existing schedules and
+    # scripts keep meaning what they meant. "all" is everything.
+    ap.add_argument("job", choices=["sync", "analyse", "prices", "both", "all"])
     ap.add_argument("--dry-run", action="store_true",
-                    help="print the plan without writing to HA or Keep")
+                    help="print the plan without writing to HA or Grocy")
     args = ap.parse_args()
     DRY_RUN = args.dry_run
     if DRY_RUN:
         print("*** DRY RUN — nothing will be written ***")
 
     rc = 0
-    if args.job in ("sync", "both"):
+    if args.job in ("sync", "both", "all"):
         rc |= job_sync()
-    if args.job in ("analyse", "both"):
+    if args.job in ("analyse", "both", "all"):
         rc |= job_analyse()
+    if args.job in ("prices", "all"):
+        rc |= job_prices()
     return rc
 
 

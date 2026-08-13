@@ -19,7 +19,7 @@ push to main ──► GitHub Actions: tests + hygiene ──► image to GHCR, 
    git fetch ── new commit? ── does the sha- image exist? ───┘
         │                          │
         │                          └─ no: CI still running or failed → wait
-        └─ yes: smoke-test it — `both --dry-run` against the LIVE Grocy and HA
+        └─ yes: smoke-test it — `all --dry-run` against the LIVE Grocy and HA
                     │
                     ├─ exit 0  → git reset --hard, pin the image, record the commit
                     └─ exit ≠0 → promote nothing; the box keeps running the last good commit
@@ -32,7 +32,7 @@ The security properties, in order of how much they carry:
 - **The tests are the gate.** If one fails, no image is built, and the agent
   has literally nothing to roll out.
 - **The dry run is the second gate.** A cron worker has no container to
-  healthcheck, so `both --dry-run` stands in — and it's a stronger check than
+  healthcheck, so `all --dry-run` stands in — and it's a stronger check than
   a healthcheck, because it exercises the real credentials, the real API
   shapes and the real reconcile logic before any write is permitted.
 - **Everything is pinned to a commit SHA.** The agent deploys `sha-<commit>`,
@@ -175,9 +175,9 @@ state produces no output. Other outcomes:
 
 ---
 
-## Part 2: The three User Scripts
+## Part 2: The four User Scripts
 
-unRAID → **Settings → User Scripts** → **Add New Script**, three times. Each
+unRAID → **Settings → User Scripts** → **Add New Script**, four times. Each
 one is a stub pointing at a script *inside the repo*, so they update
 themselves along with everything else.
 
@@ -186,6 +186,7 @@ themselves along with everything else.
 | `ha-setup-deploy` | `*/5 * * * *` |
 | `grocy-lists-sync` | `*/15 * * * *` |
 | `grocy-lists-analyse` | `0 6 * * 1` |
+| `grocy-lists-prices` | `0 7 * * *` |
 
 These are the round minutes, which is what is installed. Note what that
 implies: the deploy agent and the sync job fire together at :00, :15, :30 and
@@ -234,6 +235,20 @@ exec /mnt/user/appdata/ha-setup/repo/grocy-to-keep-integration/deploy/grocy-list
   >> /mnt/user/appdata/ha-setup/grocy-lists.log 2>&1
 ```
 
+**`grocy-lists-prices`**
+
+```bash
+#!/bin/bash
+#description=Fill empty barcode prices from purchase history and Salling. Log: /mnt/user/appdata/ha-setup/grocy-lists.log
+exec /mnt/user/appdata/ha-setup/repo/grocy-to-keep-integration/deploy/grocy-lists-prices.sh \
+  >> /mnt/user/appdata/ha-setup/grocy-lists.log 2>&1
+```
+
+Daily rather than monthly, and only the Salling half needs it: clearances
+rotate within a day, so a monthly poll would see one arbitrary day's markdowns
+and miss the other twenty-nine. The purchase-history half converges after the
+first run and then finds nothing to do.
+
 For each: **Save**, then in the dropdown beside the script choose **Custom**,
 enter the cron expression, **Apply**.
 
@@ -246,7 +261,7 @@ seconds, and the alternative is a set of jobs that look installed and never run:
 grep -E 'ha-setup|grocy-lists' /etc/cron.d/root
 ```
 
-Three lines, with the right expressions. If not: run `update_cron` and check
+Four lines, with the right expressions. If not: run `update_cron` and check
 again. Still nothing → reopen the User Scripts page, set the schedule, Apply,
 `update_cron`. Worth re-checking once after a server reboot.
 

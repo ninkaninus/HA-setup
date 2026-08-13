@@ -23,7 +23,7 @@ push to main ──► CI: tests + hygiene ──► ghcr.io/…:sha-<commit>
                                                  ▲
    unRAID, every 5 min:  git fetch ──────────────┘
         └─ new commit + image exists?
-             └─ smoke-test it (`both --dry-run`, live Grocy + HA, writes nothing)
+             └─ smoke-test it (`all --dry-run`, live Grocy + HA, writes nothing)
                   ├─ exit 0  → pin the image, reset the tree to that commit
                   └─ exit ≠0 → promote nothing; keep running the last good commit
 ```
