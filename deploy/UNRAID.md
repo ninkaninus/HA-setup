@@ -181,24 +181,31 @@ unRAID → **Settings → User Scripts** → **Add New Script**, three times. Ea
 one is a stub pointing at a script *inside the repo*, so they update
 themselves along with everything else.
 
-| Script name | Schedule (Custom) | Effectively |
-|---|---|---|
-| `ha-setup-deploy` | `2,7,12,17,22,27,32,37,42,47,52,57 * * * *` | every 5 min |
-| `grocy-lists-sync` | `4,19,34,49 * * * *` | every 15 min |
-| `grocy-lists-analyse` | `23 6 * * 1` | Mondays 06:23 |
+| Script name | Schedule (Custom) |
+|---|---|
+| `ha-setup-deploy` | `*/5 * * * *` |
+| `grocy-lists-sync` | `*/15 * * * *` |
+| `grocy-lists-analyse` | `0 6 * * 1` |
 
-The odd minutes are deliberate, and cron cannot express them as `*/5` — a
-step expression always starts at zero. Three reasons they are worth spelling
-out in full:
+These are the round minutes, which is what is installed. Note what that
+implies: the deploy agent and the sync job fire together at :00, :15, :30 and
+:45, and share those minutes with every other cron on the box, including
+`allergiscan-deploy`. At this workload that is fine — one image pull and one
+dry run.
 
-- `*/5` and `*/15` fire on the same minutes as every other cron on the box,
-  including `allergiscan-deploy`. Two deploy agents pulling images at once is
-  contention for nothing.
-- The sync minutes avoid the deploy minutes entirely, so a sync can never read
-  the image pin in the instant the agent is replacing it. (The pin is written
-  by atomic rename, so this is belt and braces — but the belt is free.)
-- Nothing here needs to happen at a particular second, so spreading the load
-  costs nothing at all.
+**Once heavier jobs land here, offset them.** Cron cannot express an offset
+step (`*/5` always counts from zero), so the minutes have to be listed:
+
+| Script name | Offset schedule |
+|---|---|
+| `ha-setup-deploy` | `2,7,12,17,22,27,32,37,42,47,52,57 * * * *` |
+| `grocy-lists-sync` | `4,19,34,49 * * * *` |
+| `grocy-lists-analyse` | `23 6 * * 1` |
+
+The sync minutes are chosen to miss every deploy minute. That matters because
+a cron job reads the image pin *without* taking the deploy lock — so while the
+schedules overlap, the atomic rename in `promote()` is the only thing
+preventing a run from reading a half-written image ref. Do not remove it.
 
 **`ha-setup-deploy`**
 
