@@ -109,10 +109,22 @@ price can never be attached to the wrong product. Salling is asked only about
 barcodes your own history can't answer. No token, no store id, a 404 (that
 store doesn't stock it), or an API failure just skips that barcode.
 
-**Prices are per store**, so `SALLING_STORE_ID` decides both the price and the
-hit rate. Measured against Bilka Tilst — the widest range in the group — 6 of
-15 plausible barcodes returned a price. REMA and Coop private label (26 of the
-92) can never hit, being other chains' brands.
+**Prices are per store.** `SALLING_STORE_ID` takes a comma-separated list and
+rotates it by ISO week, so two shops alternate odd and even weeks. That widens
+coverage as well as being fair to both: a barcode the small Netto doesn't carry
+may be found at the Bilka a fortnight later, and since only empty prices are
+filled, the ranges accumulate instead of fighting. Measured on six known-good
+barcodes — Netto Bjæverskov 5/6, Bilka Waves 6/6, with real price differences
+between them (flormelis 10,50 vs 10,95).
+
+Two things keep the scarce quota useful:
+
+- **Other chains' own brands are skipped.** 26 of the 92 unpriced barcodes are
+  REMA or Coop private label and can never be at Salling. `SALLING_SKIP_PREFIXES`
+  holds those GS1 company prefixes.
+- **Each week starts where the last left off.** The quota covers only part of
+  the list, and a miss leaves the barcode empty — so without rotating, the same
+  first 90 would be re-asked every week and the rest never looked up at all.
 
 The response nests the price under `instore`, alongside a `unitPrice` that is
 the comparison price per litre or kilo: 23,75/l for a tin of coconut milk that

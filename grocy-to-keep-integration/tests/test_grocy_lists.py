@@ -337,6 +337,68 @@ def test_a_zero_price_is_not_treated_as_a_price():
     assert g.extract_price({"instore": {"price": 0}}) is None
 
 
+NETTO = "8093199f-aff0-46a1-8c93-324c396ab124"
+BILKA = "c6744248-cf95-43c3-aa43-d3daef2aeb4b"
+
+
+def test_two_stores_alternate_by_odd_and_even_week():
+    assert g.pick_store([NETTO, BILKA], week=34) == NETTO
+    assert g.pick_store([NETTO, BILKA], week=35) == BILKA
+    assert g.pick_store([NETTO, BILKA], week=36) == NETTO
+
+
+def test_the_alternation_holds_across_the_year_boundary():
+    """ISO weeks run to 52 or 53. A 53-week year makes week 53 and week 1 pick
+    the same store — harmless, since only empty prices are ever filled, but
+    worth knowing it is a skipped turn rather than a bug."""
+    assert g.pick_store([NETTO, BILKA], week=53) == BILKA
+    assert g.pick_store([NETTO, BILKA], week=1) == BILKA
+
+
+def test_one_store_is_used_every_week():
+    assert g.pick_store([NETTO], week=34) == NETTO
+    assert g.pick_store([NETTO], week=35) == NETTO
+
+
+def test_no_stores_means_the_salling_half_is_skipped():
+    assert g.pick_store([], week=34) == ""
+
+
+@pytest.mark.parametrize("barcode,expected", [
+    ("5710405090951", True),      # a brand Salling might carry
+    ("8710604750950", True),
+    ("5705830017093", False),     # REMA 1000 own brand
+    ("5705001412108", False),     # ØGO, Coop own brand
+    ("", False),
+])
+def test_other_chains_own_brands_are_not_worth_a_lookup(barcode, expected):
+    """Purely a quota saving — 26 of 92 barcodes here are another chain's
+    private label and can never be found at Salling. Being wrong about one
+    costs a skipped lookup, never a wrong price."""
+    assert g.worth_asking(barcode) is expected
+
+
+def test_each_week_asks_about_a_different_slice():
+    """The bug this prevents: the quota only covers part of the list, and a
+    miss leaves the barcode empty, so starting from the top every week would
+    re-ask the same first 90 forever and never reach the rest."""
+    items = list(range(10))
+    assert g.rotate(items, week=0, window=4)[0] == 0
+    assert g.rotate(items, week=1, window=4)[0] == 4
+    assert g.rotate(items, week=2, window=4)[0] == 8
+
+
+def test_rotation_wraps_and_keeps_every_item():
+    items = list(range(10))
+    for week in range(12):
+        assert sorted(g.rotate(items, week, window=4)) == items
+
+
+@pytest.mark.parametrize("items,window", [([], 4), ([1, 2], 0)])
+def test_rotation_handles_nothing_to_do(items, window):
+    assert g.rotate(items, week=3, window=window) == items
+
+
 # --------------------------------------------------------------- reconcile
 
 

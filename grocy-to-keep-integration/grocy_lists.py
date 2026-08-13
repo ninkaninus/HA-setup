@@ -180,10 +180,9 @@ PRICE_LOOKBACK_DAYS = int(os.environ.get("PRICE_LOOKBACK_DAYS", 1825))
 # the purchase-history backfill. Free key from developer.sallinggroup.dev,
 # scope "Products EAN" (GET /v2/products/{ean}).
 SALLING_TOKEN = os.environ.get("SALLING_TOKEN", "")
-# Prices are per physical store, so the lookup needs one. A UUID from the
-# Stores API — the store you actually shop in, since it decides both the price
-# and whether the product is stocked at all. Without it the Salling half is
-# skipped.
+# Prices are per physical store, so the lookup needs one. Comma-separated UUIDs
+# from the Stores API are rotated by ISO week number, so two ids alternate odd
+# and even weeks. Without any, the Salling half is skipped.
 SALLING_STORE_ID = os.environ.get("SALLING_STORE_ID", "")
 # One request per barcode, and the quota is 100 PER DAY. 90 leaves headroom for
 # a manual run on the same day without tripping it. With ~128 unpriced barcodes
@@ -195,6 +194,16 @@ SALLING_MAX_LOOKUPS = int(os.environ.get("SALLING_MAX_LOOKUPS", 90))
 # firing a dozen requests back to back gets 429s regardless of how much of the
 # daily allowance is left. Measured while developing this, not guessed.
 SALLING_DELAY = float(os.environ.get("SALLING_DELAY", 1.5))
+# GS1 company prefixes belonging to OTHER chains' private label, which Salling
+# by definition does not sell: 5705830 is REMA 1000, 5705001 is Coop (ØGO).
+# 26 of the 92 unpriced barcodes here are one of those, so without this a
+# third of a scarce daily quota is spent on guaranteed misses. Skipping only
+# ever costs a lookup, never a wrong price.
+SALLING_SKIP_PREFIXES = tuple(
+    p.strip() for p in
+    os.environ.get("SALLING_SKIP_PREFIXES", "5705830,5705001").split(",")
+    if p.strip()
+)
 
 USER_AGENT = os.environ.get("USER_AGENT", "grocy-lists/1.0")
 
@@ -809,8 +818,45 @@ def extract_price(payload):
     return _as_price(payload.get("price"))
 
 
-def salling_price(ean):
-    """Shelf price for one barcode at SALLING_STORE_ID, or None.
+def pick_store(ids, week):
+    """Which store to ask this week — ids rotated by ISO week number.
+
+    With two ids that is a plain odd/even alternation, and it buys more than
+    fairness between the shops: a barcode the small Netto does not stock may
+    be found at the Bilka a fortnight later. Because only EMPTY prices are
+    ever filled, the two stores' ranges accumulate rather than overwrite each
+    other, and no product ends up flapping between two shops' prices."""
+    if not ids:
+        return ""
+    return ids[week % len(ids)]
+
+
+def store_ids():
+    return [s.strip() for s in SALLING_STORE_ID.split(",") if s.strip()]
+
+
+def worth_asking(barcode):
+    """False for barcodes Salling cannot possibly stock — another chain's own
+    brand. Purely a quota saving; being wrong costs one skipped lookup."""
+    return bool(barcode) and not barcode.startswith(SALLING_SKIP_PREFIXES)
+
+
+def rotate(items, week, window):
+    """Start each week's lookups where the last week's left off.
+
+    Without this the run always starts at the top of the list, and since a
+    miss leaves the barcode empty, the same first `window` barcodes would be
+    re-asked every week forever — anything past that position would never be
+    looked up at all. Rotating means the whole list is covered over a few
+    weeks, however small the quota is relative to it."""
+    if not items or window <= 0:
+        return items
+    start = (week * window) % len(items)
+    return items[start:] + items[:start]
+
+
+def salling_price(ean, store_id):
+    """Shelf price for one barcode at that store, or None.
 
     404 is the normal case, not an error: it means that store does not stock
     the product. Anything else unexpected also yields None — an opportunistic
@@ -818,7 +864,7 @@ def salling_price(ean):
     r = SESSION.get(
         f"https://api.sallinggroup.com/v2/products/{ean}",
         headers={"Authorization": f"Bearer {SALLING_TOKEN}"},
-        params={"storeId": SALLING_STORE_ID},
+        params={"storeId": store_id},
         timeout=30,
     )
     if r.status_code == 404:
@@ -855,6 +901,16 @@ def job_prices():
     print(f"prices: {len(empty)} of {len(barcodes)} barcodes have no price; "
           f"{len(own)} products have one in your purchase history")
 
+    week = datetime.now().isocalendar()[1]
+    store = pick_store(store_ids(), week)
+    # Lookups start where last week's left off, so the whole list gets covered
+    # over a few weeks rather than the first 90 being re-asked forever.
+    empty = rotate(empty, week, SALLING_MAX_LOOKUPS)
+    if SALLING_TOKEN and store:
+        askable = sum(1 for b in empty if worth_asking(str(b.get("barcode") or "")))
+        print(f"  salling: week {week}, store {store}, "
+              f"{askable} of {len(empty)} barcodes worth asking about")
+
     from_history = from_salling = 0
     looked_up = misses = 0
     for b in empty:
@@ -866,12 +922,12 @@ def job_prices():
         # Salling is asked only about barcodes your own history cannot answer,
         # and only up to a cap: this is a free API offered for non-commercial
         # use, and a bug that turned it into a tight loop would be abusing it.
-        if (price is None and SALLING_TOKEN and SALLING_STORE_ID and code
+        if (price is None and SALLING_TOKEN and store and worth_asking(code)
                 and looked_up < SALLING_MAX_LOOKUPS):
             if looked_up:
                 time.sleep(SALLING_DELAY)   # burst limit, see SALLING_DELAY
             try:
-                price = salling_price(code)
+                price = salling_price(code, store)
                 looked_up += 1
                 if price is None:
                     misses += 1
