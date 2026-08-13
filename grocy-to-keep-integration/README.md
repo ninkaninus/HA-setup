@@ -12,7 +12,7 @@ as desired state, converging the household's Home Assistant list onto it.
 |---|---|---|
 | `sync` | every ~15 min | `todo.indkob` — the **shared** household shopping list |
 | `analyse` | weekly | `todo.grocy_forslag` — suggested `min_stock_amount` per product; and `default_best_before_days` in Grocy |
-| `prices` | daily | `product_barcodes.last_price` in Grocy, where it is empty |
+| `prices` | weekly | `product_barcodes.last_price` in Grocy, where it is empty |
 
 `min_stock_amount` is written to Grocy **only** when a suggestion is ticked.
 Deriving a suggestion never changes Grocy by itself.
@@ -102,12 +102,22 @@ at the till. `prices` fills the empty ones from two **exact-keyed** sources:
 | Source | Key | Coverage |
 |---|---|---|
 | Your own purchase history | product id | 31 barcodes across 17 products |
-| Salling Anti Food Waste | EAN | whatever is marked down near `SALLING_ZIP` today |
+| Salling Products EAN API | EAN | whatever Netto/Føtex/Bilka sell |
 
-Salling's feed publishes an EAN and the **original** shelf price alongside each
-markdown. The original is what gets used — the markdown is what a nearly-expired
-unit costs today, and writing that in would make the whole shelf look cheap.
-No token, no `SALLING_ZIP`, or an API failure just skips that half.
+`GET /v2/products/{ean}` — barcode in, shelf price out, so a price can never be
+attached to the wrong product. Salling is asked only about barcodes your own
+history can't answer. No token, a 404 (Salling doesn't sell it), or an API
+failure just skips that barcode.
+
+**The quota shapes the schedule.** 100 requests per day, one per barcode, so
+`SALLING_MAX_LOOKUPS` is 90 and the job runs weekly: two passes to cover ~128
+unpriced barcodes, then only the misses are re-asked. A 429 aborts the rest of
+the run rather than hammering. Access must also be **requested** in the portal
+— signing up doesn't grant it.
+
+Its response schema isn't published, so `extract_price` looks for a price under
+any of several plausible field names and returns nothing when it recognises
+none — a schema change degrades to "skip", never to a wrong number.
 
 It only ever fills **empty** prices, so it cannot overwrite what the household
 typed, and it is safe to run repeatedly.

@@ -277,53 +277,47 @@ def test_purchases_without_a_usable_price_are_ignored(row):
     assert g.latest_purchase_price([row]) == {}
 
 
-def test_salling_yields_the_original_price_not_the_markdown():
-    """The markdown is what a nearly-expired unit costs today. Writing that in
-    would make the whole shelf look cheaper than it is."""
-    payload = [{
-        "store": {"name": "Netto Testby"},
-        "clearances": [{
-            "offer": {"ean": "5705830017093", "originalPrice": 19.95,
-                      "newPrice": 7.00, "currency": "DKK"},
-            "product": {"ean": "5705830017093", "description": "Tun i vand"},
-        }],
-    }]
-    assert g.parse_salling(payload) == {"5705830017093": 19.95}
+# Salling's /v2/products/{ean} response shape is not published, so extract_price
+# is written to tolerate several plausible schemas. These cases pin that
+# tolerance down — and, more importantly, pin down that anything it does not
+# recognise yields None rather than a guess.
 
 
-def test_the_same_product_in_several_stores_is_reduced_to_the_median():
-    payload = [
-        {"clearances": [{"offer": {"ean": "1", "originalPrice": 10.0}}]},
-        {"clearances": [{"offer": {"ean": "1", "originalPrice": 12.0}}]},
-        {"clearances": [{"offer": {"ean": "1", "originalPrice": 11.0}}]},
-    ]
-    assert g.parse_salling(payload) == {"1": 11.0}
-
-
-def test_the_ean_falls_back_to_the_product_when_the_offer_lacks_one():
-    payload = [{"clearances": [
-        {"offer": {"originalPrice": 5.0}, "product": {"ean": "5705830000001"}},
-    ]}]
-    assert g.parse_salling(payload) == {"5705830000001": 5.0}
+@pytest.mark.parametrize("payload,expected", [
+    ({"ean": "1", "price": 19.95}, 19.95),
+    ({"ean": "1", "salesPrice": 19.95}, 19.95),
+    ({"ean": "1", "currentPrice": 19.95}, 19.95),
+    ({"product": {"ean": "1", "price": 19.95}}, 19.95),
+    ({"data": {"price": 19.95}}, 19.95),
+    ({"prices": [{"price": 19.95}]}, 19.95),
+    ({"ean": "1", "price": "19.95"}, 19.95),          # numeric string
+])
+def test_a_price_is_found_in_any_plausible_shape(payload, expected):
+    assert g.extract_price(payload) == expected
 
 
 @pytest.mark.parametrize("payload", [
-    [],
-    {},
-    {"stores": []},
-    [{"clearances": []}],
-    [{"clearances": [{"offer": {"ean": "1"}}]}],                  # no price
-    [{"clearances": [{"offer": {"ean": "", "originalPrice": 5}}]}],  # no ean
-    [{"clearances": [{"offer": {"ean": "1", "originalPrice": "n/a"}}]}],
-    [{"clearances": [{"offer": {"ean": "1", "originalPrice": 0}}]}],
-    [{"clearances": ["nonsense"]}],
-    ["nonsense"],
-    {"unexpected": "shape"},
+    {}, [], None, "nope", 42,
+    {"ean": "1"},                                     # no price at all
+    {"ean": "1", "price": None},
+    {"ean": "1", "price": 0},
+    {"ean": "1", "price": -5},
+    {"ean": "1", "price": "gratis"},
+    {"product": None},
+    {"prices": []},
+    {"prices": ["nonsense"]},
+    {"description": "Tun i vand", "unrelated": {"nested": 12}},
 ])
-def test_an_unrecognised_salling_shape_yields_nothing_rather_than_guesses(payload):
-    """This runs unattended against a loosely documented response. Returning
-    nothing is always safe; guessing writes a wrong price into Grocy."""
-    assert g.parse_salling(payload) == {}
+def test_an_unrecognised_shape_yields_no_price_rather_than_a_guess(payload):
+    """A schema change must degrade to "skip this barcode", never to a wrong
+    number. Nobody re-checks a price that is already filled in."""
+    assert g.extract_price(payload) is None
+
+
+def test_a_zero_price_is_not_treated_as_a_price():
+    """Grocy reads 0 as "unset", so writing 0 would be a no-op dressed up as a
+    decision — and would stop the barcode being retried next run."""
+    assert g.extract_price({"price": 0}) is None
 
 
 # --------------------------------------------------------------- reconcile

@@ -186,7 +186,7 @@ themselves along with everything else.
 | `ha-setup-deploy` | `*/5 * * * *` |
 | `grocy-lists-sync` | `*/15 * * * *` |
 | `grocy-lists-analyse` | `0 6 * * 1` |
-| `grocy-lists-prices` | `0 7 * * *` |
+| `grocy-lists-prices` | `0 7 * * 2` |
 
 These are the round minutes, which is what is installed. Note what that
 implies: the deploy agent and the sync job fire together at :00, :15, :30 and
@@ -239,15 +239,16 @@ exec /mnt/user/appdata/ha-setup/repo/grocy-to-keep-integration/deploy/grocy-list
 
 ```bash
 #!/bin/bash
-#description=Fill empty barcode prices from purchase history and Salling. Log: /mnt/user/appdata/ha-setup/grocy-lists.log
+#description=Fill empty barcode prices from purchase history and Salling EAN lookup. Log: /mnt/user/appdata/ha-setup/grocy-lists.log
 exec /mnt/user/appdata/ha-setup/repo/grocy-to-keep-integration/deploy/grocy-lists-prices.sh \
   >> /mnt/user/appdata/ha-setup/grocy-lists.log 2>&1
 ```
 
-Daily rather than monthly, and only the Salling half needs it: clearances
-rotate within a day, so a monthly poll would see one arbitrary day's markdowns
-and miss the other twenty-nine. The purchase-history half converges after the
-first run and then finds nothing to do.
+Weekly, and the quota decides it: Salling allows **100 requests per day** and
+each barcode costs one, so a run covers 90 and the ~128 unpriced barcodes take
+two passes. Monthly would take two months to converge; daily would re-ask about
+products Salling doesn't sell, every day, forever. Tuesday keeps it clear of
+Monday's analyse run.
 
 For each: **Save**, then in the dropdown beside the script choose **Custom**,
 enter the cron expression, **Apply**.

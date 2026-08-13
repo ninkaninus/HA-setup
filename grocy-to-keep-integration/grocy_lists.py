@@ -176,9 +176,15 @@ SET_BARCODE_PRICES = os.environ.get("SET_BARCODE_PRICES", "1") == "1"
 # years ago beats no price at all, and it is only ever a pre-fill.
 PRICE_LOOKBACK_DAYS = int(os.environ.get("PRICE_LOOKBACK_DAYS", 1825))
 # Optional. Without a token the Salling half is skipped and the job still does
-# the purchase-history backfill. Free key from developer.sallinggroup.dev.
+# the purchase-history backfill. Free key from developer.sallinggroup.dev,
+# scope "Products EAN" (GET /v2/products/{ean}).
 SALLING_TOKEN = os.environ.get("SALLING_TOKEN", "")
-SALLING_ZIP = os.environ.get("SALLING_ZIP", "")
+# One request per barcode, and the quota is 100 PER DAY. 90 leaves headroom for
+# a manual run on the same day without tripping it. With ~128 unpriced barcodes
+# the first pass therefore takes two runs, which is why this is scheduled
+# weekly rather than monthly: monthly would take two months to converge for no
+# gain. A 429 aborts the rest of the run either way.
+SALLING_MAX_LOOKUPS = int(os.environ.get("SALLING_MAX_LOOKUPS", 90))
 
 USER_AGENT = os.environ.get("USER_AGENT", "grocy-lists/1.0")
 
@@ -750,62 +756,78 @@ def latest_purchase_price(rows):
     return {pid: price for pid, (_, price) in best.items()}
 
 
-def parse_salling(payload):
-    """{barcode: original shelf price} from the Anti Food Waste response.
-
-    ORIGINAL price, never the markdown — the markdown is what a nearly-expired
-    unit costs today, and writing that in as the product's price would make
-    everything look systematically cheap than it is.
-
-    Written defensively because this runs unattended against a response shape
-    that is only loosely documented: anything unrecognised is skipped, never
-    guessed at. Several stores report the same product, so prices are
-    collected and the median taken."""
-    seen = defaultdict(list)
-    stores = payload if isinstance(payload, list) else payload.get("stores", [])
-    if not isinstance(stores, list):
-        return {}
-    for store in stores:
-        if not isinstance(store, dict):
-            continue
-        for c in store.get("clearances") or []:
-            if not isinstance(c, dict):
-                continue
-            offer = c.get("offer") or {}
-            product = c.get("product") or {}
-            ean = str(offer.get("ean") or product.get("ean") or "").strip()
-            try:
-                price = float(offer.get("originalPrice"))
-            except (TypeError, ValueError):
-                continue
-            if ean and price > 0:
-                seen[ean].append(price)
-    return {ean: statistics.median(v) for ean, v in seen.items()}
-
-
-def salling_lookup():
-    """Ask Salling what is on clearance nearby. Failures here are not fatal:
-    it is an opportunistic extra, and the purchase-history backfill is the
-    half that always works."""
-    if not SALLING_TOKEN or not SALLING_ZIP:
-        return {}
+def _as_price(value):
+    """A positive number, or None. Grocy would happily store a string."""
     try:
-        r = SESSION.get(
-            "https://api.sallinggroup.com/v1/food-waste/",
-            headers={"Authorization": f"Bearer {SALLING_TOKEN}"},
-            params={"zip": SALLING_ZIP},
-            timeout=30,
-        )
-        r.raise_for_status()
-        prices = parse_salling(r.json())
-    except requests.RequestException as e:
-        print(f"  salling lookup failed, skipping: {e}", file=sys.stderr)
-        return {}
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
+# The response shape of /v2/products/{ean} is not published, so rather than
+# hard-coding one guess we look for a price under any of the names such an API
+# plausibly uses, at the top level or one level in. Finding nothing is a safe
+# outcome — the barcode is simply skipped.
+PRICE_KEYS = ("price", "salesPrice", "currentPrice", "retailPrice",
+              "unitPrice", "amount")
+PRICE_HOLDERS = ("product", "data", "result", "item")
+
+
+def extract_price(payload):
+    """Pull a price out of a Salling product response.
+
+    Deliberately shape-tolerant. This runs unattended and its input is an API
+    whose schema this code has never seen — the first real response is the
+    only documentation there is. Returning None on anything unfamiliar keeps a
+    schema change from turning into a wrong price in Grocy."""
+    if not isinstance(payload, dict):
+        return None
+
+    for key in PRICE_KEYS:
+        price = _as_price(payload.get(key))
+        if price:
+            return price
+
+    for holder in PRICE_HOLDERS:
+        sub = payload.get(holder)
+        if isinstance(sub, dict):
+            for key in PRICE_KEYS:
+                price = _as_price(sub.get(key))
+                if price:
+                    return price
+
+    prices = payload.get("prices")
+    if isinstance(prices, list):
+        for entry in prices:
+            if isinstance(entry, dict):
+                for key in PRICE_KEYS:
+                    price = _as_price(entry.get(key))
+                    if price:
+                        return price
+    return None
+
+
+def salling_price(ean):
+    """Current shelf price for one barcode, or None.
+
+    404 is the normal case, not an error: it means Salling does not sell that
+    product. Anything else unexpected also yields None — an opportunistic
+    source must never be able to fail the job."""
+    r = SESSION.get(
+        f"https://api.sallinggroup.com/v2/products/{ean}",
+        headers={"Authorization": f"Bearer {SALLING_TOKEN}"},
+        timeout=30,
+    )
+    if r.status_code == 404:
+        return None
+    if r.status_code == 429:
+        raise RuntimeError("rate limited")
+    r.raise_for_status()
+    try:
+        return extract_price(r.json())
     except ValueError:
-        print("  salling returned unparsable JSON, skipping", file=sys.stderr)
-        return {}
-    print(f"  salling: {len(prices)} barcodes on clearance near {SALLING_ZIP}")
-    return prices
+        return None
 
 
 def job_prices():
@@ -823,7 +845,6 @@ def job_prices():
     products = product_catalogue()
     barcodes = grocy("objects/product_barcodes")
     own = latest_purchase_price(stock_log_rows("purchase", PRICE_LOOKBACK_DAYS))
-    external = salling_lookup()
 
     empty = [b for b in barcodes
              if str(b.get("last_price") or "").strip() in ("", "0", "0.0")]
@@ -831,12 +852,27 @@ def job_prices():
           f"{len(own)} products have one in your purchase history")
 
     from_history = from_salling = 0
+    looked_up = misses = 0
     for b in empty:
         pid = int(b["product_id"])
         code = str(b.get("barcode") or "").strip()
+
         price, source = own.get(pid), "purchase history"
-        if price is None:
-            price, source = external.get(code), "salling"
+
+        # Salling is asked only about barcodes your own history cannot answer,
+        # and only up to a cap: this is a free API offered for non-commercial
+        # use, and a bug that turned it into a tight loop would be abusing it.
+        if price is None and SALLING_TOKEN and code and looked_up < SALLING_MAX_LOOKUPS:
+            try:
+                price = salling_price(code)
+                looked_up += 1
+                if price is None:
+                    misses += 1
+            except (requests.RequestException, RuntimeError) as e:
+                print(f"  salling lookup stopped: {e}", file=sys.stderr)
+                break
+            source = "salling"
+
         if price is None:
             continue
 
@@ -853,6 +889,9 @@ def job_prices():
         else:
             from_history += 1
 
+    if looked_up:
+        print(f"  salling: asked about {looked_up} barcodes, "
+              f"{looked_up - misses} known, {misses} not sold there")
     print(f"  filled {from_history} from purchase history, "
           f"{from_salling} from salling")
     return 0
