@@ -117,7 +117,7 @@ filled, the ranges accumulate instead of fighting. Measured on six known-good
 barcodes — Netto Bjæverskov 5/6, Bilka Waves 6/6, with real price differences
 between them (flormelis 10,50 vs 10,95).
 
-Two things keep the scarce quota useful:
+Three things keep the scarce quota useful:
 
 - **Other chains' own brands are skipped.** 26 of the 92 unpriced barcodes are
   REMA or Coop private label and can never be at Salling. `SALLING_SKIP_PREFIXES`
@@ -125,6 +125,25 @@ Two things keep the scarce quota useful:
 - **Each week starts where the last left off.** The quota covers only part of
   the list, and a miss leaves the barcode empty — so without rotating, the same
   first 90 would be re-asked every week and the rest never looked up at all.
+- **Repeated denials retire a barcode.** After `SALLING_MISS_LIMIT` (4) misses
+  it drops out of the rotation, and is retried once `SALLING_RETRY_DAYS` (365)
+  have passed — ranges change, so "not sold here" is a fact about today rather
+  than forever.
+
+### Where the miss count lives
+
+In a Grocy **userfield** on the barcode, `salling_probe`, holding `misses:date`
+(`4:2026-08-13`). The worker creates the field itself on first run.
+
+That keeps the worker stateless — no volume, no local database — and puts the
+record next to the thing it describes. Grocy returns userfields inline with the
+bulk barcode fetch once one is defined, so reading the state costs no extra
+requests at all.
+
+An unreadable marker **fails open**: it costs one wasted lookup, whereas failing
+closed would silently retire a barcode for good. The `note` field was the
+obvious alternative and is deliberately not used — it belongs to the household,
+and one barcode already says "ÆG!!".
 
 The response nests the price under `instore`, alongside a `unitPrice` that is
 the comparison price per litre or kilo: 23,75/l for a tin of coconut milk that

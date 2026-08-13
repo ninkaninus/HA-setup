@@ -204,6 +204,14 @@ SALLING_SKIP_PREFIXES = tuple(
     os.environ.get("SALLING_SKIP_PREFIXES", "5705830,5705001").split(",")
     if p.strip()
 )
+# Barcodes Salling has denied this many times are assumed not to be sold there
+# and are dropped from the rotation, freeing the quota for ones that might
+# still land. Not forever, though: ranges change, so they are retried once a
+# year. State lives in a Grocy userfield on the barcode — the worker stays
+# stateless, and the record sits next to the thing it describes.
+SALLING_MISS_LIMIT = int(os.environ.get("SALLING_MISS_LIMIT", 4))
+SALLING_RETRY_DAYS = int(os.environ.get("SALLING_RETRY_DAYS", 365))
+PROBE_FIELD = "salling_probe"
 
 USER_AGENT = os.environ.get("USER_AGENT", "grocy-lists/1.0")
 
@@ -377,6 +385,17 @@ def reconcile(entity, desired, owned):
 
 
 # ------------------------------------------------------- approved changes
+
+
+def grocy_post(path, body):
+    r = SESSION.post(
+        f"{GROCY_URL}/api/{path}",
+        headers={"GROCY-API-KEY": GROCY_KEY, "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.content else None
 
 
 def grocy_put(path, body):
@@ -835,6 +854,53 @@ def store_ids():
     return [s.strip() for s in SALLING_STORE_ID.split(",") if s.strip()]
 
 
+def parse_probe(value):
+    """"3:2026-08-13" -> (3, date). Anything unreadable -> (0, None).
+
+    Failing open is the right direction: a corrupted marker costs one extra
+    lookup, whereas failing closed would silently retire a barcode for good."""
+    misses, last = 0, None
+    if not isinstance(value, str):
+        return misses, last
+    count, _, stamp = value.partition(":")
+    try:
+        misses = max(0, int(count))
+    except ValueError:
+        return 0, None
+    last = _date(stamp)
+    return misses, last
+
+
+def should_ask(probe_value, today):
+    """False for a barcode Salling has repeatedly denied, until its yearly
+    retry comes round. Ranges change, so "not sold here" is never permanent."""
+    misses, last = parse_probe(probe_value)
+    if misses < SALLING_MISS_LIMIT:
+        return True
+    if last is None:
+        return True
+    return (today - last).days >= SALLING_RETRY_DAYS
+
+
+def ensure_probe_field():
+    """Define the userfield that records misses, if it is not there already.
+
+    Idempotent, and the only schema change this worker ever makes. Grocy
+    returns userfields inline on the bulk barcode fetch once one exists, so
+    reading the state afterwards costs nothing."""
+    for uf in grocy("objects/userfields"):
+        if uf.get("entity") == "product_barcodes" and uf.get("name") == PROBE_FIELD:
+            return
+    grocy_post("objects/userfields", {
+        "entity": "product_barcodes",
+        "name": PROBE_FIELD,
+        "caption": "Salling lookup state (set by grocy_lists)",
+        "type": "text-single-line",
+        "show_as_column_in_tables": 0,
+    })
+    print(f"  created Grocy userfield {PROBE_FIELD!r} on product_barcodes")
+
+
 def worth_asking(barcode):
     """False for barcodes Salling cannot possibly stock — another chain's own
     brand. Purely a quota saving; being wrong costs one skipped lookup."""
@@ -901,13 +967,22 @@ def job_prices():
     print(f"prices: {len(empty)} of {len(barcodes)} barcodes have no price; "
           f"{len(own)} products have one in your purchase history")
 
-    week = datetime.now().isocalendar()[1]
+    now = datetime.now()
+    week = now.isocalendar()[1]
     store = pick_store(store_ids(), week)
     # Lookups start where last week's left off, so the whole list gets covered
     # over a few weeks rather than the first 90 being re-asked forever.
     empty = rotate(empty, week, SALLING_MAX_LOOKUPS)
-    if SALLING_TOKEN and store:
-        askable = sum(1 for b in empty if worth_asking(str(b.get("barcode") or "")))
+
+    salling_on = bool(SALLING_TOKEN and store)
+    if salling_on and not DRY_RUN:
+        ensure_probe_field()
+    if salling_on:
+        askable = sum(
+            1 for b in empty
+            if worth_asking(str(b.get("barcode") or ""))
+            and should_ask((b.get("userfields") or {}).get(PROBE_FIELD), now)
+        )
         print(f"  salling: week {week}, store {store}, "
               f"{askable} of {len(empty)} barcodes worth asking about")
 
@@ -922,19 +997,33 @@ def job_prices():
         # Salling is asked only about barcodes your own history cannot answer,
         # and only up to a cap: this is a free API offered for non-commercial
         # use, and a bug that turned it into a tight loop would be abusing it.
-        if (price is None and SALLING_TOKEN and store and worth_asking(code)
+        probe = (b.get("userfields") or {}).get(PROBE_FIELD)
+        if (price is None and salling_on and worth_asking(code)
+                and should_ask(probe, now)
                 and looked_up < SALLING_MAX_LOOKUPS):
             if looked_up:
                 time.sleep(SALLING_DELAY)   # burst limit, see SALLING_DELAY
             try:
                 price = salling_price(code, store)
                 looked_up += 1
-                if price is None:
-                    misses += 1
             except (requests.RequestException, RuntimeError) as e:
                 print(f"  salling lookup stopped: {e}", file=sys.stderr)
                 break
             source = "salling"
+
+            # Record the outcome so a barcode Salling keeps denying drops out
+            # of the rotation. Cleared on a hit, since the barcode now has a
+            # price and a stale marker would only mislead a later reader.
+            if not DRY_RUN:
+                if price is None:
+                    seen, _ = parse_probe(probe)
+                    grocy_put(f"userfields/product_barcodes/{b['id']}",
+                              {PROBE_FIELD: f"{seen + 1}:{now:%Y-%m-%d}"})
+                elif probe:
+                    grocy_put(f"userfields/product_barcodes/{b['id']}",
+                              {PROBE_FIELD: ""})
+            if price is None:
+                misses += 1
 
         if price is None:
             continue

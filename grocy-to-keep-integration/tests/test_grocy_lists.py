@@ -6,6 +6,8 @@ the shopping list is SHARED, and a predicate that drifts by one character
 starts deleting hand-added rows on a 15-minute timer.
 """
 
+from datetime import datetime
+
 import pytest
 
 import grocy_lists as g
@@ -397,6 +399,52 @@ def test_rotation_wraps_and_keeps_every_item():
 @pytest.mark.parametrize("items,window", [([], 4), ([1, 2], 0)])
 def test_rotation_handles_nothing_to_do(items, window):
     assert g.rotate(items, week=3, window=window) == items
+
+
+# ------------------------------------------------------- known-miss tracking
+
+TODAY = datetime(2026, 8, 13)
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("3:2026-08-13", (3, datetime(2026, 8, 13))),
+    ("0:2026-08-13", (0, datetime(2026, 8, 13))),
+    ("2", (2, None)),
+])
+def test_a_probe_marker_round_trips(value, expected):
+    assert g.parse_probe(value) == expected
+
+
+@pytest.mark.parametrize("value", [None, "", "nonsense", ":", "x:2026-08-13", 42, {}])
+def test_an_unreadable_marker_fails_open(value):
+    """Fail open on purpose: a corrupt marker costs one extra lookup, while
+    failing closed would silently retire a barcode for good."""
+    assert g.parse_probe(value) == (0, None)
+    assert g.should_ask(value, TODAY) is True
+
+
+def test_a_barcode_under_the_miss_limit_is_still_asked():
+    assert g.should_ask("3:2026-08-10", TODAY) is True
+
+
+def test_a_barcode_at_the_miss_limit_drops_out_of_the_rotation():
+    """Four denials is Salling saying it doesn't stock it. Continuing to ask
+    spends a quota of 100/day on a guaranteed miss."""
+    assert g.should_ask("4:2026-08-10", TODAY) is False
+    assert g.should_ask("9:2026-08-10", TODAY) is False
+
+
+def test_a_retired_barcode_is_retried_after_a_year():
+    """Ranges change. "Not sold here" is a fact about today, not forever."""
+    assert g.should_ask("4:2025-08-14", TODAY) is False   # 364 days
+    assert g.should_ask("4:2025-08-13", TODAY) is True    # 365 days
+    assert g.should_ask("9:2024-01-01", TODAY) is True
+
+
+def test_a_retired_barcode_with_no_date_is_asked_again():
+    """No date means the marker predates this scheme or was hand-edited;
+    asking once is cheaper than retiring it on evidence we can't read."""
+    assert g.should_ask("7", TODAY) is True
 
 
 # --------------------------------------------------------------- reconcile
