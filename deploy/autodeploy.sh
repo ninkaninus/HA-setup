@@ -48,7 +48,7 @@ SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-300}"
 # unit's env file is $SECRETS_DIR/<name>.env and its pinned image ref is
 # written to $STATE_DIR/<name>.image, which is what the cron scripts read.
 UNITS=(
-    "grocy-lists|sync --dry-run"
+    "grocy-lists|both --dry-run"
 )
 
 # Repo files on unRAID are typically owned by root or nobody; without this
@@ -88,6 +88,10 @@ env_file_for() {
 # prints the full plan and writes nothing, so this is safe to run on every
 # deploy — and a failure here is exactly the class of breakage that would
 # otherwise land silently on her shopping list.
+#
+# `both`, not `sync`: analyse writes default_best_before_days to Grocy without
+# any approval step, which makes it the least supervised thing here and so the
+# most worth exercising before promotion. It costs one extra stock_log fetch.
 smoke() {
     local name=$1 image=$2 env_file=$3
     shift 3

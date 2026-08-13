@@ -132,6 +132,30 @@ MIN_SHELF_OBS = int(os.environ.get("MIN_SHELF_OBS", 2))
 # Flag when this fraction of units were consumed after their best-before date.
 LATE_USE_FLAG = float(os.environ.get("LATE_USE_FLAG", 0.34))
 
+# --- automatic default_best_before_days ------------------------------------
+# Grocy pre-fills the best-before date at purchase from this field, so setting
+# it is what makes a barcode scan land on a sensible date. It is written
+# WITHOUT approval, unlike min_stock_amount — a deliberate exception, on the
+# grounds that the physical date on the package is checked at purchase anyway,
+# so a wrong default costs a correction rather than a spoiled product.
+#
+# That exception is only defensible because the bar is in the data instead:
+# more observations than a suggestion needs, and they have to agree with each
+# other. When they don't, nothing is written and the field is left alone.
+SET_DEFAULT_EXPIRY = os.environ.get("SET_DEFAULT_EXPIRY", "1") == "1"
+# Higher than MIN_SHELF_OBS: that one gates a number you are about to eyeball
+# on a list, this one gates a number that silently pre-fills every future
+# purchase of the product.
+MIN_SHELF_OBS_WRITE = int(os.environ.get("MIN_SHELF_OBS_WRITE", 4))
+# Median absolute deviation over the median. A product observed at 3, 5 and
+# 400 days has no meaningful default, and an average of one would be worse
+# than leaving the field empty.
+SHELF_REL_SPREAD = float(os.environ.get("SHELF_REL_SPREAD", 0.4))
+# Leave an existing value alone unless the observations disagree with it by
+# more than this. Some defaults were set by hand and are roughly right; only
+# the badly wrong ones are worth overwriting.
+EXPIRY_CHANGE_THRESHOLD = float(os.environ.get("EXPIRY_CHANGE_THRESHOLD", 0.3))
+
 USER_AGENT = os.environ.get("USER_AGENT", "grocy-lists/1.0")
 
 SEP = " — "  # separates product name from the level annotation
@@ -389,6 +413,8 @@ def product_catalogue():
             "name": name,
             "min": float(p.get("min_stock_amount") or 0),
             "qu": units.get(int(p["qu_id_stock"] or 0), ""),
+            # Grocy uses -1 for "never expires", 0/empty for "not set".
+            "bbd": int(p.get("default_best_before_days") or 0),
         }
     return products
 
@@ -458,6 +484,80 @@ def _date(s):
         return datetime.strptime(s[:10], "%Y-%m-%d")
     except ValueError:
         return None
+
+
+def shelf_default_for(observations, current):
+    """The default_best_before_days to write, or None to leave the field alone.
+
+    Pure, and deliberately conservative — it says None far more often than it
+    says a number. Every reason to decline is a case where writing something
+    would be worse than writing nothing:
+
+      too few observations   a guess dressed as a default
+      -1 already set         someone declared this never expires; not ours
+      observations disagree  no single number describes the product
+      close to what is set   a hand-set value that is already roughly right
+
+    Rounds DOWN, the opposite of min_stock_amount's rounding up. Both round
+    towards the safe error: an extra packet on the shelf, and a best-before
+    warning that comes early rather than late."""
+    if len(observations) < MIN_SHELF_OBS_WRITE:
+        return None
+    if current < 0:
+        return None
+
+    med = statistics.median(observations)
+    if med < 1:
+        return None
+
+    # Median absolute deviation, not stdev: one mis-typed date should not be
+    # able to veto a product whose other observations agree perfectly.
+    mad = statistics.median([abs(x - med) for x in observations])
+    if mad / med > SHELF_REL_SPREAD:
+        return None
+
+    value = int(math.floor(med))
+    if value < 1 or value == current:
+        return None
+    if current > 0 and abs(value - current) / current <= EXPIRY_CHANGE_THRESHOLD:
+        return None
+    return value
+
+
+def apply_shelf_defaults(products, shelf_obs):
+    """Write observed shelf life back to Grocy as default_best_before_days.
+
+    The second write path to Grocy, and the only one that runs unattended.
+    It exists so that scanning a barcode at purchase pre-fills a sensible
+    best-before date instead of today's.
+
+    Note the feedback loop this creates: once the field is set, Grocy offers
+    that date at purchase, and accepting it makes the next observation echo
+    this value rather than the package. What breaks the loop is the human
+    checking the physical date — which is exactly the habit that makes writing
+    without approval acceptable in the first place. It is also why the median
+    is taken over the whole window rather than the most recent observations."""
+    if not SET_DEFAULT_EXPIRY:
+        return 0
+
+    written = 0
+    for pid, obs in sorted(shelf_obs.items()):
+        p = products.get(pid)
+        if not p:
+            continue
+        value = shelf_default_for(obs, p["bbd"])
+        if value is None:
+            continue
+        was = p["bbd"] or "unset"
+        if DRY_RUN:
+            print(f"  [dry-run] would set default_best_before_days={value} on "
+                  f"{p['name']!r} (was {was}, {len(obs)} observations)")
+        else:
+            grocy_put(f"objects/products/{pid}", {"default_best_before_days": value})
+            print(f"  set default_best_before_days={value} on {p['name']!r} "
+                  f"(was {was}, {len(obs)} observations)")
+        written += 1
+    return written
 
 
 def job_analyse():
@@ -588,6 +688,13 @@ def job_analyse():
           f"{LOOKBACK_DAYS}d; {qualified} meet MIN_EVENTS={MIN_EVENTS}; "
           f"{with_shelf} have usable shelf-life data; {len(desired)} suggestions")
     reconcile(SUGGEST_LIST, desired, owns_suggestion)
+
+    # Runs on every product with observations, not just the ones that produced
+    # a suggestion: a product whose minimum is already right still benefits
+    # from a sensible best-before default at the till.
+    changed = apply_shelf_defaults(products, shelf_obs)
+    if changed:
+        print(f"  default_best_before_days: {changed} product(s) updated")
     return 0
 
 

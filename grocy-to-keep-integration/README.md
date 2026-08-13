@@ -11,10 +11,14 @@ as desired state, converging the household's Home Assistant list onto it.
 | Job | Cadence | Writes to |
 |---|---|---|
 | `sync` | every ~15 min | `todo.indkob` — the **shared** household shopping list |
-| `analyse` | weekly | `todo.grocy_forslag` — suggested `min_stock_amount` per product |
+| `analyse` | weekly | `todo.grocy_forslag` — suggested `min_stock_amount` per product; and `default_best_before_days` in Grocy |
 
-Grocy is written to **only** when a suggestion is ticked. Deriving a suggestion
-never changes Grocy by itself.
+`min_stock_amount` is written to Grocy **only** when a suggestion is ticked.
+Deriving a suggestion never changes Grocy by itself.
+
+`default_best_before_days` is the deliberate exception: it is written without
+approval, so that scanning a barcode at purchase pre-fills a sensible
+best-before date. See [Automatic expiry defaults](#automatic-expiry-defaults).
 
 Google Keep support was removed: the account is in Google's Advanced Protection
 Program, which permanently disables the App Passwords `gkeepapi` needs. The
@@ -54,6 +58,39 @@ Flags are written at the **front** of the annotation, immediately after the
 separator. The HA todo-list card truncates each row to one line on a phone, so
 anything appended to the end is precisely what gets cut off — which was the
 warnings.
+
+## Automatic expiry defaults
+
+Grocy pre-fills the best-before date at purchase from the product's
+`default_best_before_days`. It was set on 5 of 109 products, so scanning a
+barcode mostly offered today's date. `analyse` now writes that field from the
+same observed shelf life it already computes.
+
+This is the only thing the worker changes in Grocy unattended. The justification
+is that the date on the package is read at purchase anyway, so a wrong default
+costs a correction rather than a spoiled product — which means the bar has to
+live in the data instead of in a human. It writes only when:
+
+| Condition | Default | Why |
+|---|---|---|
+| at least `MIN_SHELF_OBS_WRITE` observations | 4 | double the bar for a suggestion, which someone eyeballs |
+| observations agree — MAD/median ≤ `SHELF_REL_SPREAD` | 0.4 | 3, 5, 300, 400 days describes no single product |
+| current value is not `-1` | | `-1` is Grocy's "never expires", said deliberately |
+| differs from an existing value by > `EXPIRY_CHANGE_THRESHOLD` | 0.3 | a hand-set 30 against an observed 32 isn't worth a write |
+
+The median is **rounded down** — the opposite of `min_stock_amount`, which
+rounds up. Both round towards the safe error: an extra packet on the shelf, and
+a warning that comes early rather than late.
+
+**The feedback loop is real and worth knowing about.** Once the field is set,
+Grocy offers that date at purchase; accepting it makes the next observation echo
+our own value rather than the package. What breaks the loop is someone reading
+the physical date — the same habit that makes writing without approval
+acceptable. It's also why the median is taken over the whole window rather than
+the most recent few.
+
+Set `SET_DEFAULT_EXPIRY=0` to turn it off. `analyse --dry-run` prints every
+change it would make.
 
 ## Approving a suggestion — one click
 
@@ -138,9 +175,12 @@ worker is how you get overlapping runs.
 - **Adds land before removes.** `reconcile()` computes the whole plan first,
   then applies adds and renames, and only then removals — so a mid-run failure
   leaves extra items rather than missing ones.
-- **Only ticking writes to Grocy.** Deriving a suggestion never changes Grocy;
-  `apply_approved()` is the single write path and runs only against the
-  suggestions list.
+- **Only ticking changes a minimum.** Deriving a suggestion never changes
+  `min_stock_amount`; `apply_approved()` is its single write path and runs only
+  against the suggestions list.
+- **`default_best_before_days` is the one unattended write**, and it must stay
+  the only one. Adding a second silent write path is how this stops being
+  predictable — every other change to Grocy is a thing the household did.
 
 ## Do not
 

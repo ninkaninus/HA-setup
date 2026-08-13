@@ -137,6 +137,119 @@ def test_an_unparsable_row_yields_no_match_rather_than_a_wrong_number():
     assert g.SUGGEST_RE.search("Mælk — min noget til 2 Liter") is None
 
 
+# ------------------------------------------------ default_best_before_days
+#
+# This is the one write path that runs unattended, so the tests are about
+# when it must REFUSE to write. Writing nothing is always safe; writing a
+# number derived from thin or contradictory data silently pre-fills every
+# future purchase of that product.
+
+
+def test_a_clear_shelf_life_is_written_when_the_field_is_unset():
+    assert g.shelf_default_for([30, 32, 29, 31], current=0) == 30
+
+
+def test_the_median_is_rounded_down():
+    """Opposite of min_stock_amount's rounding up. Both round towards the
+    safe error: a best-before warning that comes early, not late."""
+    assert g.shelf_default_for([10, 10, 11, 11], current=0) == 10
+
+
+def test_too_few_observations_writes_nothing():
+    """MIN_SHELF_OBS_WRITE is 4 — higher than the 2 that gates a suggestion,
+    because nobody eyeballs this one."""
+    assert g.shelf_default_for([30, 30, 30], current=0) is None
+
+
+def test_observations_that_disagree_write_nothing():
+    """Two clusters, 4 days apart and 350 days apart, describe no single
+    product. Any number here would be worse than an empty field."""
+    assert g.shelf_default_for([3, 5, 300, 400], current=0) is None
+
+
+def test_a_lone_wild_value_among_a_tight_cluster_still_writes():
+    """Documenting the edge of the spread guard rather than pretending it
+    isn't there: 3/5/8 agree closely enough that the 400 reads as a mistyped
+    sentinel, so this writes 6. That is the intended trade — the alternative
+    is one bad date vetoing an otherwise clear product."""
+    assert g.shelf_default_for([3, 5, 8, 400], current=0) == 6
+
+
+def test_a_single_outlier_does_not_veto_a_consistent_product():
+    """MAD rather than stdev: one mis-typed date shouldn't block a product
+    whose other observations agree."""
+    assert g.shelf_default_for([30, 31, 30, 29, 300], current=0) == 30
+
+
+def test_never_expires_is_left_alone():
+    """-1 is Grocy's 'never overdue'. Someone said that deliberately."""
+    assert g.shelf_default_for([30, 30, 30, 30], current=-1) is None
+
+
+def test_an_existing_value_that_is_roughly_right_is_left_alone():
+    """A hand-set 30 against an observed 32 is not worth a write."""
+    assert g.shelf_default_for([32, 32, 33, 31], current=30) is None
+
+
+def test_an_existing_value_that_is_badly_wrong_is_corrected():
+    assert g.shelf_default_for([300, 305, 295, 302], current=30) == 301
+
+
+def test_a_sub_day_shelf_life_writes_nothing():
+    """Rounding down would give 0, which Grocy reads as 'not set' — so the
+    write would be a no-op that looks like a decision."""
+    assert g.shelf_default_for([0.5, 0.6, 0.4, 0.5], current=0) is None
+
+
+def test_writing_is_skipped_entirely_when_disabled(monkeypatch):
+    monkeypatch.setattr(g, "SET_DEFAULT_EXPIRY", False)
+    calls = []
+    monkeypatch.setattr(g, "grocy_put", lambda *a, **k: calls.append(a))
+
+    written = g.apply_shelf_defaults(
+        {1: {"name": "Mælk", "bbd": 0}}, {1: [30, 30, 31, 29]})
+
+    assert written == 0
+    assert calls == []
+
+
+def test_a_dry_run_writes_nothing(monkeypatch, capsys):
+    monkeypatch.setattr(g, "SET_DEFAULT_EXPIRY", True)
+    monkeypatch.setattr(g, "DRY_RUN", True)
+    calls = []
+    monkeypatch.setattr(g, "grocy_put", lambda *a, **k: calls.append(a))
+
+    written = g.apply_shelf_defaults(
+        {1: {"name": "Mælk", "bbd": 0}}, {1: [30, 30, 31, 29]})
+
+    assert written == 1
+    assert calls == []
+    assert "would set default_best_before_days=30" in capsys.readouterr().out
+
+
+def test_only_the_expiry_field_is_written(monkeypatch):
+    """The PUT must not carry min_stock_amount along with it — that field has
+    an approval gate, and this path deliberately has none."""
+    monkeypatch.setattr(g, "SET_DEFAULT_EXPIRY", True)
+    monkeypatch.setattr(g, "DRY_RUN", False)
+    calls = []
+    monkeypatch.setattr(g, "grocy_put", lambda path, body: calls.append((path, body)))
+
+    g.apply_shelf_defaults({7: {"name": "Mælk", "bbd": 0}}, {7: [30, 30, 31, 29]})
+
+    assert calls == [("objects/products/7", {"default_best_before_days": 30})]
+
+
+def test_a_product_missing_from_the_catalogue_is_skipped(monkeypatch):
+    """Deactivated products are dropped by product_catalogue but can still
+    appear in the consumption log."""
+    monkeypatch.setattr(g, "SET_DEFAULT_EXPIRY", True)
+    monkeypatch.setattr(g, "DRY_RUN", False)
+    monkeypatch.setattr(g, "grocy_put", lambda *a, **k: pytest.fail("wrote"))
+
+    assert g.apply_shelf_defaults({}, {99: [30, 30, 31, 29]}) == 0
+
+
 # --------------------------------------------------------------- reconcile
 
 

@@ -19,7 +19,7 @@ push to main ──► GitHub Actions: tests + hygiene ──► image to GHCR, 
    git fetch ── new commit? ── does the sha- image exist? ───┘
         │                          │
         │                          └─ no: CI still running or failed → wait
-        └─ yes: smoke-test it — `sync --dry-run` against the LIVE Grocy and HA
+        └─ yes: smoke-test it — `both --dry-run` against the LIVE Grocy and HA
                     │
                     ├─ exit 0  → git reset --hard, pin the image, record the commit
                     └─ exit ≠0 → promote nothing; the box keeps running the last good commit
@@ -32,7 +32,7 @@ The security properties, in order of how much they carry:
 - **The tests are the gate.** If one fails, no image is built, and the agent
   has literally nothing to roll out.
 - **The dry run is the second gate.** A cron worker has no container to
-  healthcheck, so `sync --dry-run` stands in — and it's a stronger check than
+  healthcheck, so `both --dry-run` stands in — and it's a stronger check than
   a healthcheck, because it exercises the real credentials, the real API
   shapes and the real reconcile logic before any write is permitted.
 - **Everything is pinned to a commit SHA.** The agent deploys `sha-<commit>`,
