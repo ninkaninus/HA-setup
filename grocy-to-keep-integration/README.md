@@ -112,7 +112,7 @@ Exit codes: `0` success · `1` fatal (HTTP, network, unexpected API shape).
 
 ## Scheduling — unRAID User Scripts
 
-`sync` every 15 minutes, `analyse` Mondays at 06:00. The scripts in `deploy/`
+`sync` every 15 minutes, `analyse` Mondays at 06:23. The scripts in `deploy/`
 are thin wrappers around `../deploy/run-unit.sh`, which runs whichever image
 version the deploy agent last verified — see
 [`../deploy/UNRAID.md`](../deploy/UNRAID.md) and [SETUP.md](SETUP.md) part 2.

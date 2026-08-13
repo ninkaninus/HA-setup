@@ -121,8 +121,16 @@ promote() {
     local unit name
     for unit in "${UNITS[@]}"; do
         name=${unit%%|*}
-        printf '%s\n' "$REGISTRY/$name:sha-$sha" >"$STATE_DIR/$name.image"
+        # Written via a temp file and rename, which is atomic on the same
+        # filesystem. The cron jobs read this file without taking the deploy
+        # lock, so a plain `>` redirect leaves a window — however narrow — in
+        # which a run could read a truncated image ref and fail. The cron
+        # schedules are also offset so the two never fire in the same minute;
+        # this makes it correct rather than merely unlikely.
+        printf '%s\n' "$REGISTRY/$name:sha-$sha" >"$STATE_DIR/$name.image.tmp"
+        mv -f "$STATE_DIR/$name.image.tmp" "$STATE_DIR/$name.image"
     done
+    # Only the agent reads this, and only under flock, so a plain write is fine.
     printf '%s\n' "$sha" >"$STATE_FILE"
 }
 

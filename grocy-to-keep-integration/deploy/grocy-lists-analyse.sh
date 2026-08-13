@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# unRAID User Scripts — schedule: Custom cron   0 6 * * 1   (Mondays 06:00)
+# unRAID User Scripts — schedule: Custom cron   23 6 * * 1   (Mondays 06:23)
 #
 # Rebuilds the min_stock_amount suggestions on todo.grocy_forslag from one year
 # of consumption plus observed shelf life. Suggestions are whole numbers.
