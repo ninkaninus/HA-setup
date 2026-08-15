@@ -10,7 +10,7 @@ as desired state, converging the household's Home Assistant list onto it.
 
 | Job | Cadence | Writes to |
 |---|---|---|
-| `sync` | every ~15 min | `todo.indkob` — the **shared** household shopping list |
+| `sync` | every ~15 min | `todo.indkob` — the **shared** household shopping list, with a price sub-line per row |
 | `analyse` | weekly | `todo.grocy_forslag` — suggested `min_stock_amount` per product; and `default_best_before_days` in Grocy |
 | `prices` | weekly | `product_barcodes.last_price` in Grocy, where it is empty |
 
@@ -92,6 +92,36 @@ the most recent few.
 
 Set `SET_DEFAULT_EXPIRY=0` to turn it off. `analyse --dry-run` prints every
 change it would make.
+
+## Prices on the shopping list
+
+Each row carries a sub-line showing what it costs at each store, cheapest first:
+
+```
+Saftevand — 0/1 Flaske
+    Netto 10,00 · Bilka 18,95 · Føtex 18,95
+Myremiddel — 0/1 Stk
+    Bilka 174,90 · Føtex 204,50 · Netto 229,00
+```
+
+Cheapest first because the question the line answers is *where do I buy this*,
+so the answer is the first thing on it. Real spreads from the live data: 54 kr
+on the ant powder, nearly half price on the squash.
+
+This uses the todo item's `description`. An earlier version of this file refused
+to touch that field, but for the wrong reason — what looked bad was a
+machine-readable JSON payload, not the mechanism. It is also the only place
+detail fits: the card truncates the summary to one line on a phone, which is why
+the suggestion rows are currently cut off mid-sentence.
+
+**`sync` never calls Salling.** It runs every 15 minutes against a quota of 100
+a day, so it only ever reads prices cached in Grocy. The weekly `prices` job
+fills that cache, pricing what is actually on the list first — knowing where to
+buy the six things you need beats filling in a price for something already in
+the cupboard.
+
+Hand-added rows never get a sub-line, for the same reason they are never
+renamed or removed: the reconciler cannot see them.
 
 ## Barcode prices
 

@@ -213,6 +213,20 @@ SALLING_MISS_LIMIT = int(os.environ.get("SALLING_MISS_LIMIT", 4))
 SALLING_RETRY_DAYS = int(os.environ.get("SALLING_RETRY_DAYS", 365))
 PROBE_FIELD = "salling_probe"
 
+# --- price comparison on the shopping list ----------------------------------
+# Each row on the shared list carries a sub-line with what the item costs at
+# each store, cheapest first, so it is obvious where to buy. The todo card
+# truncates the summary to one line on a phone, so the description is the only
+# place this fits.
+SHOW_PRICES_ON_LIST = os.environ.get("SHOW_PRICES_ON_LIST", "1") == "1"
+SHELF_FIELD = "salling_shelf"
+# Refreshed when older than this. Shelf prices move slowly and the list is
+# reconciled every 15 minutes, so re-asking often would spend the whole daily
+# quota on prices that have not changed.
+SHELF_MAX_AGE_DAYS = int(os.environ.get("SHELF_MAX_AGE_DAYS", 7))
+# How many stores to show. More than three does not fit the sub-line.
+SHELF_SHOW = int(os.environ.get("SHELF_SHOW", 3))
+
 USER_AGENT = os.environ.get("USER_AGENT", "grocy-lists/1.0")
 
 SEP = " — "  # separates product name from the level annotation
@@ -324,22 +338,28 @@ def owns_suggestion(summary):
     return bool(SUGGEST_RE.search(summary.split(SEP, 1)[1]))
 
 
-def plan(entity, desired, owned):
+def plan(entity, desired, owned, notes=None):
     """Compute the full add/rename/remove plan before touching anything.
 
     desired: {key: text}. Key is the stable identity (product name); text
     is what's displayed.
+
+    notes: {key: description} — the grey sub-line the todo card renders under
+    the row. Optional; absent means every description is left alone.
 
     owned: callable(summary) -> bool, deciding which rows belong to the
     automation. Rows it rejects are INVISIBLE to the reconciler — never
     renamed, never removed, never counted. This is what lets the household
     add their own items to the same list: the worker no longer owns the
     list, only the rows it recognises as its own."""
-    current = {}
+    notes = notes or {}
+    current, current_note = {}, {}
     for item in ha_items(entity):
         if not owned(item["summary"]):
             continue
-        current[key_of(item["summary"])] = item["summary"]
+        key = key_of(item["summary"])
+        current[key] = item["summary"]
+        current_note[key] = item.get("description") or ""
 
     adds = [(key, text) for key, text in desired.items() if key not in current]
     renames = [
@@ -348,40 +368,65 @@ def plan(entity, desired, owned):
         if key in current and current[key] != text
     ]
     removes = [s for key, s in current.items() if key not in desired]
-    return adds, renames, removes
+    # Rows that stay but whose sub-line has changed — a price moved, or the
+    # row had no prices last run. Keyed by the text the row will have AFTER
+    # any rename, since descriptions are applied last.
+    redescribes = [
+        (text, notes.get(key, ""))
+        for key, text in desired.items()
+        if key in current and notes.get(key, "") != current_note.get(key, "")
+    ]
+    return adds, renames, removes, redescribes
 
 
-def reconcile(entity, desired, owned):
+def reconcile(entity, desired, owned, notes=None):
     """Apply the plan. Adds and renames run before any removal, so a
     failure part-way leaves the list with extra items rather than missing
     ones — and we abort before the removal phase if anything threw.
 
-    Items deliberately carry NO description: the todo-list card renders the
-    description under every row, so stashing a machine-readable payload there
-    put raw JSON on the dashboard. apply_approved() reads the suggestion back
-    out of the summary text instead, which is a format this file owns."""
-    adds, renames, removes = plan(entity, desired, owned)
+    Descriptions are the grey sub-line the todo card renders under each row.
+    An earlier version of this file refused to use them, but for the wrong
+    reason: what looked bad was a machine-readable JSON payload, not the
+    mechanism. Short human text is exactly what the field is for — and it is
+    the only place detail fits, since the card truncates the summary to one
+    line on a phone.
+
+    They are applied AFTER renames, because a rename changes the summary that
+    identifies the row."""
+    notes = notes or {}
+    adds, renames, removes, redescribes = plan(entity, desired, owned, notes)
 
     if DRY_RUN:
-        print(f"  [dry-run] {entity}: +{len(adds)} ~{len(renames)} -{len(removes)}")
-        for _, t in adds:
-            print(f"      + {t}")
+        print(f"  [dry-run] {entity}: +{len(adds)} ~{len(renames)} "
+              f"-{len(removes)} ≡{len(redescribes)}")
+        for key, t in adds:
+            note = notes.get(key)
+            print(f"      + {t}" + (f"\n          {note}" if note else ""))
         for _, old, new in renames:
             print(f"      ~ {old!r} -> {new!r}")
+        for text, note in redescribes:
+            print(f"      ≡ {text}\n          {note or '(cleared)'}")
         for s in removes:
             print(f"      - {s}")
         return
 
-    for _, text in adds:
-        ha("todo.add_item", {"entity_id": entity, "item": text})
+    for key, text in adds:
+        payload = {"entity_id": entity, "item": text}
+        if notes.get(key):
+            payload["description"] = notes[key]
+        ha("todo.add_item", payload)
     for _, old, new in renames:
-        # rename in place: keeps position and checked state in Keep
+        # rename in place: keeps the row's position and its ticked state
         ha("todo.update_item", {"entity_id": entity, "item": old, "rename": new})
+    for text, note in redescribes:
+        ha("todo.update_item",
+           {"entity_id": entity, "item": text, "description": note})
     # only now, once every addition has landed, remove what is no longer wanted
     for summary in removes:
         ha("todo.remove_item", {"entity_id": entity, "item": summary})
 
-    print(f"  {entity}: +{len(adds)} ~{len(renames)} -{len(removes)}")
+    print(f"  {entity}: +{len(adds)} ~{len(renames)} -{len(removes)} "
+          f"≡{len(redescribes)}")
 
 
 # ------------------------------------------------------- approved changes
@@ -490,6 +535,26 @@ def product_catalogue():
 # ---------------------------------------------------------------- job: sync
 
 
+def shelf_prices_by_product():
+    """{product_id: {store: price}} from the barcode cache.
+
+    Read-only and free: Grocy returns userfields inline with the barcodes, and
+    sync must never call Salling itself — it runs every 15 minutes against a
+    quota of 100 a day. The weekly prices job is what fills this in.
+
+    A product with several barcodes keeps the first priced one; they are the
+    same product, so a second opinion would only flicker the row."""
+    out = {}
+    for b in grocy("objects/product_barcodes"):
+        pid = int(b["product_id"])
+        if pid in out:
+            continue
+        prices, _ = parse_shelf((b.get("userfields") or {}).get(SHELF_FIELD))
+        if prices:
+            out[pid] = prices
+    return out
+
+
 def job_sync():
     # Anything she ticked on the suggestions list gets applied first, so the
     # catalogue we read below already reflects it.
@@ -497,8 +562,12 @@ def job_sync():
 
     products = product_catalogue()
     stock = {int(s["product_id"]): float(s["amount"]) for s in grocy("stock")}
+    # Prices are read from cache only — never looked up here. sync runs every
+    # 15 minutes and the Salling quota is 100 a day; the weekly prices job is
+    # what refreshes them.
+    shelf = shelf_prices_by_product() if SHOW_PRICES_ON_LIST else {}
 
-    desired = {}
+    desired, notes = {}, {}
     for pid, p in products.items():
         if p["min"] <= 0:
             continue
@@ -511,9 +580,11 @@ def job_sync():
         desired[p["name"]] = (
             f"{p['name']}{SEP}{fmt(have)}/{fmt(p['min'])} {p['qu']}".strip()
         )
+        notes[p["name"]] = price_line(shelf.get(pid, {}))
 
-    print(f"sync: {len(desired)} products below minimum")
-    reconcile(AUTO_LIST, desired, owns_stock_item)
+    priced = sum(1 for n in notes.values() if n)
+    print(f"sync: {len(desired)} products below minimum, {priced} with prices")
+    reconcile(AUTO_LIST, desired, owns_stock_item, notes)
     return 0
 
 
@@ -837,6 +908,60 @@ def extract_price(payload):
     return _as_price(payload.get("price"))
 
 
+def kr(value):
+    """Danish money: 9.5 -> "9,50". Always two decimals, unlike fmt(), which
+    drops them — a price with no øre reads as an error."""
+    return f"{float(value):.2f}".replace(".", ",")
+
+
+def parse_stores(spec):
+    """"Netto=uuid,Bilka=uuid" -> [(name, uuid)].
+
+    A bare uuid keeps working and gets a generic label, so an older one-store
+    config is not silently broken by this format."""
+    stores = []
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, sep, uuid = part.partition("=")
+        stores.append((name.strip(), uuid.strip()) if sep else ("Salling", part))
+    return stores
+
+
+def parse_shelf(value):
+    """"Netto=9.50;Bilka=9.95|2026-08-15" -> ({name: price}, date)."""
+    if not isinstance(value, str) or "|" not in value:
+        return {}, None
+    body, _, stamp = value.rpartition("|")
+    prices = {}
+    for part in body.split(";"):
+        name, sep, number = part.partition("=")
+        if not sep:
+            continue
+        price = _as_price(number)
+        if price:
+            prices[name.strip()] = price
+    return prices, _date(stamp)
+
+
+def format_shelf(prices, when):
+    body = ";".join(f"{name}={price:.2f}" for name, price in sorted(prices.items()))
+    return f"{body}|{when:%Y-%m-%d}"
+
+
+def price_line(prices, limit=None):
+    """The sub-line under a shopping-list row: cheapest store first.
+
+    Cheapest first because the question the line answers is "where should I
+    buy this", and the answer is the first thing on it."""
+    if not prices:
+        return ""
+    limit = SHELF_SHOW if limit is None else limit
+    best = sorted(prices.items(), key=lambda kv: (kv[1], kv[0]))[:limit]
+    return " · ".join(f"{name} {kr(price)}" for name, price in best)
+
+
 def pick_store(ids, week):
     """Which store to ask this week — ids rotated by ISO week number.
 
@@ -882,23 +1007,35 @@ def should_ask(probe_value, today):
     return (today - last).days >= SALLING_RETRY_DAYS
 
 
-def ensure_probe_field():
-    """Define the userfield that records misses, if it is not there already.
+USERFIELDS = {
+    PROBE_FIELD: "Salling lookup state (set by grocy_lists)",
+    SHELF_FIELD: "Salling shelf prices (set by grocy_lists)",
+}
 
-    Idempotent, and the only schema change this worker ever makes. Grocy
-    returns userfields inline on the bulk barcode fetch once one exists, so
-    reading the state afterwards costs nothing."""
-    for uf in grocy("objects/userfields"):
-        if uf.get("entity") == "product_barcodes" and uf.get("name") == PROBE_FIELD:
-            return
-    grocy_post("objects/userfields", {
-        "entity": "product_barcodes",
-        "name": PROBE_FIELD,
-        "caption": "Salling lookup state (set by grocy_lists)",
-        "type": "text-single-line",
-        "show_as_column_in_tables": 0,
-    })
-    print(f"  created Grocy userfield {PROBE_FIELD!r} on product_barcodes")
+
+def ensure_userfields():
+    """Define the userfields this worker stores its state in, if missing.
+
+    Idempotent, and the only schema change it ever makes. Grocy returns
+    userfields inline on the bulk barcode fetch once one exists, so reading
+    the state afterwards costs nothing.
+
+    The `note` field would have been the easy place for this and is
+    deliberately untouched: it belongs to the household, and one barcode
+    already says "ÆG!!"."""
+    have = {uf.get("name") for uf in grocy("objects/userfields")
+            if uf.get("entity") == "product_barcodes"}
+    for name, caption in USERFIELDS.items():
+        if name in have:
+            continue
+        grocy_post("objects/userfields", {
+            "entity": "product_barcodes",
+            "name": name,
+            "caption": caption,
+            "type": "text-single-line",
+            "show_as_column_in_tables": 0,
+        })
+        print(f"  created Grocy userfield {name!r} on product_barcodes")
 
 
 def worth_asking(barcode):
@@ -946,6 +1083,55 @@ def salling_price(ean, store_id):
         return None
 
 
+def refresh_shelf_prices(products, barcodes, stock, stores, budget, now):
+    """Price the things that are actually on the shopping list, at every store.
+
+    Runs before the last_price backfill and takes priority over it: knowing
+    where to buy the six items you need this week is worth more than filling
+    in a price for something already in the cupboard.
+
+    Returns the number of lookups spent."""
+    if not stores or budget <= 0:
+        return 0
+
+    wanted = {pid for pid, p in products.items()
+              if p["min"] > 0 and stock.get(pid, 0.0) < p["min"]}
+    spent = 0
+    for b in barcodes:
+        pid = int(b["product_id"])
+        code = str(b.get("barcode") or "").strip()
+        if pid not in wanted or not worth_asking(code):
+            continue
+        _, when = parse_shelf((b.get("userfields") or {}).get(SHELF_FIELD))
+        if when is not None and (now - when).days < SHELF_MAX_AGE_DAYS:
+            continue                      # still fresh, do not spend on it
+        if budget - spent < len(stores):
+            break                         # not enough left for a full comparison
+
+        found = {}
+        for name, uuid in stores:
+            if spent:
+                time.sleep(SALLING_DELAY)
+            try:
+                price = salling_price(code, uuid)
+            except (requests.RequestException, RuntimeError) as e:
+                print(f"  salling price refresh stopped: {e}", file=sys.stderr)
+                return spent
+            spent += 1
+            if price:
+                found[name] = price
+
+        name = (products.get(pid) or {}).get("name", code)
+        if DRY_RUN:
+            print(f"  [dry-run] {name}: {price_line(found) or 'not stocked anywhere'}")
+        else:
+            # Written even when empty, so a product no store carries is not
+            # re-priced every single run.
+            grocy_put(f"userfields/product_barcodes/{b['id']}",
+                      {SHELF_FIELD: format_shelf(found, now)})
+    return spent
+
+
 def job_prices():
     """Fill product_barcodes.last_price where it is empty, so a barcode scan
     at purchase pre-fills a price.
@@ -969,25 +1155,41 @@ def job_prices():
 
     now = datetime.now()
     week = now.isocalendar()[1]
-    store = pick_store(store_ids(), week)
+    stores = parse_stores(SALLING_STORE_ID)
+    picked = pick_store(stores, week)
+    store = picked[1] if picked else ""
     # Lookups start where last week's left off, so the whole list gets covered
     # over a few weeks rather than the first 90 being re-asked forever.
     empty = rotate(empty, week, SALLING_MAX_LOOKUPS)
 
     salling_on = bool(SALLING_TOKEN and store)
     if salling_on and not DRY_RUN:
-        ensure_probe_field()
+        ensure_userfields()
+
+    # What is on the shopping list gets priced first, at every store. Knowing
+    # where to buy the six things you need beats filling in a price for
+    # something already in the cupboard.
+    spent = 0
+    if salling_on and SHOW_PRICES_ON_LIST:
+        stock = {int(s["product_id"]): float(s["amount"]) for s in grocy("stock")}
+        spent = refresh_shelf_prices(products, barcodes, stock, stores,
+                                     SALLING_MAX_LOOKUPS, now)
+        if spent:
+            print(f"  salling: {spent} lookups pricing the shopping list "
+                  f"across {len(stores)} stores")
+
     if salling_on:
         askable = sum(
             1 for b in empty
             if worth_asking(str(b.get("barcode") or ""))
             and should_ask((b.get("userfields") or {}).get(PROBE_FIELD), now)
         )
-        print(f"  salling: week {week}, store {store}, "
+        print(f"  salling: week {week}, backfilling from {picked[0]}, "
               f"{askable} of {len(empty)} barcodes worth asking about")
 
     from_history = from_salling = 0
-    looked_up = misses = 0
+    # The shopping-list pricing above came out of the same daily allowance.
+    looked_up, misses = spent, 0
     for b in empty:
         pid = int(b["product_id"])
         code = str(b.get("barcode") or "").strip()

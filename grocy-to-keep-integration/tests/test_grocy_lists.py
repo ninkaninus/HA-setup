@@ -472,7 +472,7 @@ def test_plan_adds_renames_and_removes(list_contents):
         "Havregryn": "Havregryn — 0/1 Pakke",
     }
 
-    adds, renames, removes = g.plan("todo.indkob", desired, g.owns_stock_item)
+    adds, renames, removes, _ = g.plan("todo.indkob", desired, g.owns_stock_item)
 
     assert adds == [("Havregryn", "Havregryn — 0/1 Pakke")]
     assert renames == [("Mælk", "Mælk — 1/3 Liter", "Mælk — 2/3 Liter")]
@@ -484,7 +484,7 @@ def test_hand_added_rows_never_appear_in_a_removal(list_contents):
     list, no matter what the desired set says."""
     list_contents(HOUSEHOLD_ROWS + ["Mælk — 1/3 Liter"])
 
-    adds, renames, removes = g.plan("todo.indkob", {}, g.owns_stock_item)
+    adds, renames, removes, _ = g.plan("todo.indkob", {}, g.owns_stock_item)
 
     assert removes == ["Mælk — 1/3 Liter"]
     assert adds == []
@@ -498,7 +498,7 @@ def test_a_converged_list_is_a_no_op(list_contents):
     list is the churn bug coming back."""
     list_contents(["Mælk — 1/3 Liter", "Blomster til bordet"])
 
-    adds, renames, removes = g.plan(
+    adds, renames, removes, _ = g.plan(
         "todo.indkob", {"Mælk": "Mælk — 1/3 Liter"}, g.owns_stock_item)
 
     assert (adds, renames, removes) == ([], [], [])
@@ -511,7 +511,114 @@ def test_a_ticked_row_still_counts_as_present(monkeypatch):
         {"summary": "Mælk — 1/3 Liter", "status": "completed"},
     ])
 
-    adds, _, _ = g.plan(
+    adds, _, _, _ = g.plan(
         "todo.indkob", {"Mælk": "Mælk — 1/3 Liter"}, g.owns_stock_item)
 
     assert adds == []
+
+
+# ------------------------------------------------- price sub-line on the list
+
+
+def test_money_always_keeps_its_oere():
+    """fmt() drops trailing zeros, which is right for quantities and wrong for
+    money: "9,5 kr" reads as a typo."""
+    assert g.kr(9.5) == "9,50"
+    assert g.kr(10) == "10,00"
+    assert g.kr(12.345) == "12,35"
+
+
+def test_stores_are_parsed_with_their_names():
+    assert g.parse_stores("Netto=aaa,Bilka=bbb") == [("Netto", "aaa"), ("Bilka", "bbb")]
+
+
+def test_a_bare_uuid_still_works():
+    """An older single-store config must not break on the new format."""
+    assert g.parse_stores("aaa") == [("Salling", "aaa")]
+    assert g.parse_stores("") == []
+
+
+def test_shelf_prices_round_trip():
+    prices = {"Netto": 9.5, "Bilka": 9.95}
+    encoded = g.format_shelf(prices, datetime(2026, 8, 15))
+    assert g.parse_shelf(encoded) == (prices, datetime(2026, 8, 15))
+
+
+def test_an_empty_shelf_record_still_carries_its_date():
+    """Written even when no store stocks the product, so it is not re-priced
+    on every run — the date is what makes "nobody has it" a cached answer."""
+    prices, when = g.parse_shelf(g.format_shelf({}, datetime(2026, 8, 15)))
+    assert prices == {}
+    assert when == datetime(2026, 8, 15)
+
+
+@pytest.mark.parametrize("value", [None, "", "garbage", "Netto=9.50", 42])
+def test_an_unreadable_shelf_record_is_treated_as_missing(value):
+    assert g.parse_shelf(value) == ({}, None)
+
+
+def test_the_cheapest_store_comes_first():
+    """The line answers "where do I buy this", so the answer is first."""
+    line = g.price_line({"Bilka": 9.95, "Netto": 9.50, "Føtex": 10.25})
+    assert line == "Netto 9,50 · Bilka 9,95 · Føtex 10,25"
+
+
+def test_only_the_configured_number_of_stores_is_shown():
+    line = g.price_line({"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0}, limit=3)
+    assert line == "A 1,00 · B 2,00 · C 3,00"
+
+
+def test_no_prices_means_no_sub_line():
+    """An empty description clears the row's sub-line rather than writing
+    something like "ingen priser", which would be noise on every row."""
+    assert g.price_line({}) == ""
+
+
+def test_a_changed_price_updates_the_sub_line(monkeypatch):
+    monkeypatch.setattr(g, "ha_items", lambda entity: [
+        {"summary": "Mælk — 1/3 Liter", "status": "needs_action",
+         "description": "Netto 9,50"},
+    ])
+    _, _, _, redescribes = g.plan(
+        "todo.indkob", {"Mælk": "Mælk — 1/3 Liter"}, g.owns_stock_item,
+        {"Mælk": "Netto 8,95 · Bilka 9,95"})
+    assert redescribes == [("Mælk — 1/3 Liter", "Netto 8,95 · Bilka 9,95")]
+
+
+def test_an_unchanged_sub_line_is_not_rewritten(monkeypatch):
+    """Otherwise every 15-minute run would rewrite every description."""
+    monkeypatch.setattr(g, "ha_items", lambda entity: [
+        {"summary": "Mælk — 1/3 Liter", "status": "needs_action",
+         "description": "Netto 9,50"},
+    ])
+    _, _, _, redescribes = g.plan(
+        "todo.indkob", {"Mælk": "Mælk — 1/3 Liter"}, g.owns_stock_item,
+        {"Mælk": "Netto 9,50"})
+    assert redescribes == []
+
+
+def test_hand_added_rows_get_no_sub_line_even_if_named(monkeypatch):
+    """A note keyed to something the worker does not own must never reach the
+    list — the household's rows stay exactly as they wrote them."""
+    monkeypatch.setattr(g, "ha_items", lambda entity: [
+        {"summary": "Blomster til bordet", "status": "needs_action",
+         "description": ""},
+    ])
+    adds, renames, removes, redescribes = g.plan(
+        "todo.indkob", {}, g.owns_stock_item,
+        {"Blomster til bordet": "Netto 9,50"})
+    assert (adds, renames, removes, redescribes) == ([], [], [], [])
+
+
+def test_an_item_with_no_description_key_at_all_is_handled(monkeypatch):
+    """Verified against HA 2026.6.3: todo.get_items returns "description": ""
+    on some items and omits the key entirely on others, in the same response.
+    Treating the missing key as anything but empty would rewrite that row's
+    sub-line on every 15-minute run, forever."""
+    monkeypatch.setattr(g, "ha_items", lambda entity: [
+        {"summary": "Mælk — 1/3 Liter", "status": "needs_action"},   # no key
+    ])
+    _, _, _, redescribes = g.plan(
+        "todo.indkob", {"Mælk": "Mælk — 1/3 Liter"}, g.owns_stock_item,
+        {"Mælk": ""})
+    assert redescribes == []
