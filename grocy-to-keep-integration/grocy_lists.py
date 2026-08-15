@@ -94,9 +94,11 @@ import json
 import math
 import os
 import re
+import difflib
 import statistics
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -226,6 +228,43 @@ SHELF_FIELD = "salling_shelf"
 SHELF_MAX_AGE_DAYS = int(os.environ.get("SHELF_MAX_AGE_DAYS", 7))
 # How many stores to show. More than three does not fit the sub-line.
 SHELF_SHOW = int(os.environ.get("SHELF_SHOW", 3))
+
+# --- weekly offers (tilbud) -------------------------------------------------
+# From Tjek (eTilbudsavis), which aggregates most Danish chains: REMA 1000,
+# Lidl, Netto, Føtex, Bilka, MENY, SPAR, Løvbjerg, nemlig. Free, no key.
+#
+# Coop IS included, via Kvickly, SuperBrugsen, Brugsen and 365discount. An
+# early 8-query sample missed them and this comment used to say otherwise —
+# a reminder that "not in my sample" is not "not there".
+#
+# Offers carry NO barcode, so they are matched on product name. That is the
+# same technique rejected for shelf prices, and it is allowed here for two
+# reasons: the threshold is high enough that most offers match nothing and are
+# dropped (6 of 372 matched, all 6 correct), and an offer is shown to be read,
+# not written into Grocy. A wrong shelf price is invisible; a wrong offer costs
+# a glance. They are marked with ⚡ on the row so the distinction stays visible.
+SHOW_OFFERS = os.environ.get("SHOW_OFFERS", "1") == "1"
+TJEK_URL = "https://squid-api.tjek.com/v2/offers/search"
+# Only near-identical names. Precision here comes from being allowed to answer
+# "no match" — the earlier attempt always took the best of 3844 products and so
+# put a bar of soap's price on the lasagne.
+OFFER_MATCH_MIN = float(os.environ.get("OFFER_MATCH_MIN", 0.80))
+OFFER_SHOW = int(os.environ.get("OFFER_SHOW", 2))
+# Offers run in weekly cycles and the job that fetches them is weekly, so this
+# only guards against a same-week second run.
+OFFER_MAX_AGE_DAYS = int(os.environ.get("OFFER_MAX_AGE_DAYS", 3))
+OFFER_FIELD = "offers"
+# Tjek indexes more than supermarkets. Without an allowlist, "Spagetti" matched
+# AB Catering at 79,00 — a wholesale catering pack — and the German border
+# shops (Fleggaard, Poetzsch, Nielsen Scan-Shop) turn up constantly for someone
+# who is never going to drive to Padborg for pasta. An allowlist rather than a
+# blocklist: a new wholesaler appearing should be ignored by default, not
+# quietly trusted.
+OFFER_DEALERS = tuple(d.strip().lower() for d in os.environ.get(
+    "OFFER_DEALERS",
+    "rema 1000,netto,føtex,foetex,bilka,lidl,aldi,kvickly,superbrugsen,"
+    "brugsen,dagli'brugsen,365discount,coop,meny,spar,løvbjerg,nemlig"
+).split(",") if d.strip())
 
 USER_AGENT = os.environ.get("USER_AGENT", "grocy-lists/1.0")
 
@@ -535,6 +574,17 @@ def product_catalogue():
 # ---------------------------------------------------------------- job: sync
 
 
+def offers_by_product():
+    """{product_id: [offer]} from the product cache. Read-only, like the shelf
+    prices: sync never queries Tjek itself."""
+    out = {}
+    for p in grocy("objects/products"):
+        found, _ = parse_offers((p.get("userfields") or {}).get(OFFER_FIELD))
+        if found:
+            out[int(p["id"])] = found
+    return out
+
+
 def shelf_prices_by_product():
     """{product_id: {store: price}} from the barcode cache.
 
@@ -566,6 +616,8 @@ def job_sync():
     # 15 minutes and the Salling quota is 100 a day; the weekly prices job is
     # what refreshes them.
     shelf = shelf_prices_by_product() if SHOW_PRICES_ON_LIST else {}
+    offers = offers_by_product() if SHOW_OFFERS else {}
+    now = datetime.now()
 
     desired, notes = {}, {}
     for pid, p in products.items():
@@ -580,7 +632,12 @@ def job_sync():
         desired[p["name"]] = (
             f"{p['name']}{SEP}{fmt(have)}/{fmt(p['min'])} {p['qu']}".strip()
         )
-        notes[p["name"]] = price_line(shelf.get(pid, {}))
+        # Exact shelf prices first, then any name-matched offers behind a ⚡.
+        # The card collapses newlines into one wrapped paragraph, so the marker
+        # is what separates "measured" from "matched", not a line break.
+        parts = [price_line(shelf.get(pid, {})),
+                 offer_line(offers.get(pid, []), now)]
+        notes[p["name"]] = " ".join(x for x in parts if x)
 
     priced = sum(1 for n in notes.values() if n)
     print(f"sync: {len(desired)} products below minimum, {priced} with prices")
@@ -962,6 +1019,118 @@ def price_line(prices, limit=None):
     return " · ".join(f"{name} {kr(price)}" for name, price in best)
 
 
+def norm_name(text):
+    """Fold a product name for comparison: lowercase, Danish letters spelled
+    out, punctuation dropped. "Havre drik" and "HAVREDRIK" must land close."""
+    text = unicodedata.normalize("NFKD", (text or "").lower())
+    text = text.replace("æ", "ae").replace("ø", "oe").replace("å", "aa")
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def tjek_offers(query):
+    """Danish offers matching a search term, from Tjek.
+
+    Danish only: the same endpoint serves Norway, and a third of the results
+    for a plain query come back in NOK. Currency is the filter, not the
+    dealer name — "Netto" exists in both countries."""
+    try:
+        r = SESSION.get(TJEK_URL, params={"query": query, "limit": 50}, timeout=30)
+        r.raise_for_status()
+        rows = r.json()
+    except (requests.RequestException, ValueError) as e:
+        print(f"  tjek lookup failed for {query!r}: {e}", file=sys.stderr)
+        return []
+    if not isinstance(rows, list):
+        return []
+
+    offers = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pricing = row.get("pricing") or {}
+        if pricing.get("currency") != "DKK":
+            continue
+        price = _as_price(pricing.get("price"))
+        dealer = ((row.get("dealer") or {}).get("name") or "").strip()
+        heading = (row.get("heading") or "").strip()
+        until = _date(str(row.get("run_till") or "")[:10])
+        if dealer.lower() not in OFFER_DEALERS:
+            continue
+        if price and dealer and heading:
+            offers.append({"dealer": dealer, "heading": heading,
+                           "price": price, "until": until})
+    return offers
+
+
+def match_offers(product_name, offers, limit=None, threshold=None):
+    """Offers whose heading is near-identical to the product name.
+
+    Returns cheapest first, at most one per dealer — two Lidl offers for the
+    same thing is noise on a row that has to fit a phone screen."""
+    limit = OFFER_SHOW if limit is None else limit
+    threshold = OFFER_MATCH_MIN if threshold is None else threshold
+    key = norm_name(product_name)
+    if not key:
+        return []
+
+    scored = []
+    for offer in offers:
+        score = difflib.SequenceMatcher(None, key, norm_name(offer["heading"])).ratio()
+        if score >= threshold:
+            scored.append((offer["price"], offer))
+
+    best, seen = [], set()
+    for _, offer in sorted(scored, key=lambda x: x[0]):
+        if offer["dealer"] in seen:
+            continue
+        seen.add(offer["dealer"])
+        best.append(offer)
+        if len(best) >= limit:
+            break
+    return best
+
+
+def offer_line(offers, today):
+    """"⚡ REMA 1000 12,00 til 15/8". Expired offers are dropped rather than
+    shown, since a tilbud that ended is worse than no tilbud at all."""
+    parts = []
+    for offer in offers:
+        until = offer.get("until")
+        if until is not None and until < today:
+            continue
+        when = f" til {until:%-d/%-m}" if until else ""
+        parts.append(f"{offer['dealer']} {kr(offer['price'])}{when}")
+    return ("⚡ " + " · ".join(parts)) if parts else ""
+
+
+def format_offers(offers, when):
+    body = ";".join(
+        f"{o['dealer']}={o['price']:.2f}@{o['until']:%Y-%m-%d}" if o.get("until")
+        else f"{o['dealer']}={o['price']:.2f}@"
+        for o in offers
+    )
+    return f"{body}|{when:%Y-%m-%d}"
+
+
+def parse_offers(value):
+    """Inverse of format_offers -> ([{dealer, price, until}], fetched)."""
+    if not isinstance(value, str) or "|" not in value:
+        return [], None
+    body, _, stamp = value.rpartition("|")
+    offers = []
+    for part in body.split(";"):
+        dealer, sep, rest = part.partition("=")
+        if not sep:
+            continue
+        number, _, until = rest.partition("@")
+        price = _as_price(number)
+        if price:
+            offers.append({"dealer": dealer.strip(), "price": price,
+                           "until": _date(until)})
+    return offers, _date(stamp)
+
+
 def pick_store(ids, week):
     """Which store to ask this week — ids rotated by ISO week number.
 
@@ -1007,10 +1176,13 @@ def should_ask(probe_value, today):
     return (today - last).days >= SALLING_RETRY_DAYS
 
 
-USERFIELDS = {
-    PROBE_FIELD: "Salling lookup state (set by grocy_lists)",
-    SHELF_FIELD: "Salling shelf prices (set by grocy_lists)",
-}
+USERFIELDS = [
+    ("product_barcodes", PROBE_FIELD, "Salling lookup state (set by grocy_lists)"),
+    ("product_barcodes", SHELF_FIELD, "Salling shelf prices (set by grocy_lists)"),
+    # Offers match on product NAME, so they belong to the product, not to one
+    # of its barcodes.
+    ("products", OFFER_FIELD, "Weekly offers (set by grocy_lists)"),
+]
 
 
 def ensure_userfields():
@@ -1023,19 +1195,18 @@ def ensure_userfields():
     The `note` field would have been the easy place for this and is
     deliberately untouched: it belongs to the household, and one barcode
     already says "ÆG!!"."""
-    have = {uf.get("name") for uf in grocy("objects/userfields")
-            if uf.get("entity") == "product_barcodes"}
-    for name, caption in USERFIELDS.items():
-        if name in have:
+    have = {(uf.get("entity"), uf.get("name")) for uf in grocy("objects/userfields")}
+    for entity, name, caption in USERFIELDS:
+        if (entity, name) in have:
             continue
         grocy_post("objects/userfields", {
-            "entity": "product_barcodes",
+            "entity": entity,
             "name": name,
             "caption": caption,
             "type": "text-single-line",
             "show_as_column_in_tables": 0,
         })
-        print(f"  created Grocy userfield {name!r} on product_barcodes")
+        print(f"  created Grocy userfield {name!r} on {entity}")
 
 
 def worth_asking(barcode):
@@ -1132,6 +1303,38 @@ def refresh_shelf_prices(products, barcodes, stock, stores, budget, now):
     return spent
 
 
+def refresh_offers(products, stock, now):
+    """Look up this week's offers for whatever is on the shopping list.
+
+    One Tjek query per product, and only for things actually needed — the
+    point is "there is a tilbud on something you are about to buy", which is
+    only interesting for the handful on the list."""
+    if not SHOW_OFFERS:
+        return 0
+
+    raw = {int(p["id"]): p for p in grocy("objects/products")}
+    checked = 0
+    for pid, p in products.items():
+        if p["min"] <= 0 or stock.get(pid, 0.0) >= p["min"]:
+            continue
+        cached = (raw.get(pid, {}).get("userfields") or {}).get(OFFER_FIELD)
+        _, when = parse_offers(cached)
+        if when is not None and (now - when).days < OFFER_MAX_AGE_DAYS:
+            continue
+
+        found = match_offers(p["name"], tjek_offers(p["name"]))
+        checked += 1
+        if DRY_RUN:
+            line = offer_line(found, now)
+            print(f"  [dry-run] {p['name']}: {line or 'ingen tilbud'}")
+        else:
+            # Written even when empty, so a product with no offers this week is
+            # not re-queried on every run.
+            grocy_put(f"userfields/products/{pid}",
+                      {OFFER_FIELD: format_offers(found, now)})
+    return checked
+
+
 def job_prices():
     """Fill product_barcodes.last_price where it is empty, so a barcode scan
     at purchase pre-fills a price.
@@ -1163,20 +1366,30 @@ def job_prices():
     empty = rotate(empty, week, SALLING_MAX_LOOKUPS)
 
     salling_on = bool(SALLING_TOKEN and store)
-    if salling_on and not DRY_RUN:
+    wants_list_work = SHOW_PRICES_ON_LIST or SHOW_OFFERS
+    if (salling_on or wants_list_work) and not DRY_RUN:
         ensure_userfields()
 
-    # What is on the shopping list gets priced first, at every store. Knowing
-    # where to buy the six things you need beats filling in a price for
-    # something already in the cupboard.
+    # Both of the next two steps care about what is on the shopping list, so
+    # stock is read once here rather than by each of them.
+    stock = ({int(s["product_id"]): float(s["amount"]) for s in grocy("stock")}
+             if wants_list_work else {})
+
+    # What is on the list gets priced first, at every store. Knowing where to
+    # buy the six things you need beats filling in a price for something
+    # already in the cupboard.
     spent = 0
     if salling_on and SHOW_PRICES_ON_LIST:
-        stock = {int(s["product_id"]): float(s["amount"]) for s in grocy("stock")}
         spent = refresh_shelf_prices(products, barcodes, stock, stores,
                                      SALLING_MAX_LOOKUPS, now)
         if spent:
             print(f"  salling: {spent} lookups pricing the shopping list "
                   f"across {len(stores)} stores")
+
+    if SHOW_OFFERS:
+        checked = refresh_offers(products, stock, now)
+        if checked:
+            print(f"  tilbud: checked {checked} products against Tjek")
 
     if salling_on:
         askable = sum(

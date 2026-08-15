@@ -622,3 +622,97 @@ def test_an_item_with_no_description_key_at_all_is_handled(monkeypatch):
         "todo.indkob", {"Mælk": "Mælk — 1/3 Liter"}, g.owns_stock_item,
         {"Mælk": ""})
     assert redescribes == []
+
+
+# ------------------------------------------------------------------- tilbud
+
+OFFERS = [
+    {"dealer": "REMA 1000", "heading": "Havredrik", "price": 12.0,
+     "until": datetime(2026, 8, 20)},
+    {"dealer": "Lidl", "heading": "Havre drik", "price": 10.0,
+     "until": datetime(2026, 8, 20)},
+    {"dealer": "Netto", "heading": "Chokolade", "price": 5.0,
+     "until": datetime(2026, 8, 20)},
+]
+
+
+def test_only_near_identical_names_match():
+    """The whole reason offers are allowed to use name matching: the threshold
+    is high enough that most offers match nothing and are dropped. The earlier
+    price attempt always took the best of 3844 and so could never say no."""
+    found = match_names = g.match_offers("Havre drik", OFFERS, limit=5)
+    assert [o["dealer"] for o in found] == ["Lidl", "REMA 1000"]
+    assert all(o["heading"] != "Chokolade" for o in found)
+
+
+def test_a_product_with_no_matching_offer_gets_nothing():
+    assert g.match_offers("Tandpasta", OFFERS) == []
+    assert g.match_offers("", OFFERS) == []
+
+
+def test_offers_are_cheapest_first_and_one_per_dealer():
+    duplicates = OFFERS + [{"dealer": "Lidl", "heading": "Havredrik",
+                            "price": 11.0, "until": datetime(2026, 8, 20)}]
+    found = g.match_offers("Havredrik", duplicates, limit=5)
+    dealers = [o["dealer"] for o in found]
+    assert dealers == ["Lidl", "REMA 1000"]      # 10,00 before 12,00
+    assert dealers.count("Lidl") == 1            # not twice
+
+
+def test_the_offer_line_is_marked_and_dated():
+    line = g.offer_line(OFFERS[:2], TODAY)
+    assert line.startswith("⚡ ")
+    assert "REMA 1000 12,00 til 20/8" in line
+    assert "Lidl 10,00 til 20/8" in line
+
+
+def test_an_expired_offer_is_dropped_not_shown():
+    """A tilbud that ended is worse than no tilbud — it sends you to the shop
+    for a price that is gone."""
+    stale = [{"dealer": "Lidl", "heading": "Havredrik", "price": 10.0,
+              "until": datetime(2026, 8, 1)}]
+    assert g.offer_line(stale, TODAY) == ""
+
+
+def test_an_offer_with_no_end_date_is_still_shown():
+    open_ended = [{"dealer": "Lidl", "heading": "X", "price": 10.0, "until": None}]
+    assert g.offer_line(open_ended, TODAY) == "⚡ Lidl 10,00"
+
+
+def test_no_offers_means_no_marker():
+    assert g.offer_line([], TODAY) == ""
+
+
+def test_offers_round_trip_through_the_cache():
+    encoded = g.format_offers(OFFERS[:2], datetime(2026, 8, 15))
+    decoded, when = g.parse_offers(encoded)
+    assert when == datetime(2026, 8, 15)
+    assert [(o["dealer"], o["price"], o["until"]) for o in decoded] == [
+        ("REMA 1000", 12.0, datetime(2026, 8, 20)),
+        ("Lidl", 10.0, datetime(2026, 8, 20)),
+    ]
+
+
+@pytest.mark.parametrize("value", [None, "", "junk", 42, "Lidl=10.00"])
+def test_an_unreadable_offer_cache_is_treated_as_missing(value):
+    assert g.parse_offers(value) == ([], None)
+
+
+def test_danish_letters_do_not_block_a_match():
+    """"Havre drik" vs "HAVREDRIK", "Ærter" vs "aerter" — folding has to make
+    those comparable or nothing matches."""
+    assert g.norm_name("Havre drik") == g.norm_name("HAVREDRIK")
+    assert g.norm_name("Ærter") == g.norm_name("aerter")
+    assert g.norm_name("Grød-ris ") == g.norm_name("grødris")
+
+
+def test_only_supermarkets_are_trusted_as_dealers():
+    """Tjek indexes wholesalers and German border shops too. "Spagetti"
+    matched AB Catering at 79,00 — a catering pack — and Fleggaard/Poetzsch
+    are in Germany. An allowlist, so a new wholesaler is ignored by default
+    rather than quietly trusted."""
+    assert "rema 1000" in g.OFFER_DEALERS
+    assert "kvickly" in g.OFFER_DEALERS        # Coop is included
+    assert "superbrugsen" in g.OFFER_DEALERS
+    assert "ab catering" not in g.OFFER_DEALERS
+    assert "fleggaard" not in g.OFFER_DEALERS

@@ -102,7 +102,14 @@ Saftevand — 0/1 Flaske
     Netto 10,00 · Bilka 18,95 · Føtex 18,95
 Myremiddel — 0/1 Stk
     Bilka 174,90 · Føtex 204,50 · Netto 229,00
+Revet ost — 0/1 Pose
+    Netto 14,95 · Bilka 15,50 ⚡ Kvickly 12,00 til 17/8 · SuperBrugsen 12,00 til 17/8
 ```
+
+Everything before the ⚡ is a **barcode-exact** shelf price from Salling.
+Everything after it is a **name-matched** weekly offer from Tjek. The marker is
+what keeps that distinction visible — the card collapses newlines into one
+wrapped paragraph, so a line break would not have survived.
 
 Cheapest first because the question the line answers is *where do I buy this*,
 so the answer is the first thing on it. Real spreads from the live data: 54 kr
@@ -192,6 +199,35 @@ none — a schema change degrades to "skip", never to a wrong number.
 
 It only ever fills **empty** prices, so it cannot overwrite what the household
 typed, and it is safe to run repeatedly.
+
+### Weekly offers (tilbud)
+
+From [Tjek](https://squid-api.tjek.com) (eTilbudsavis), free and unauthenticated,
+aggregating most Danish chains: REMA 1000, Lidl, Netto, Føtex, Bilka, MENY,
+SPAR, Løvbjerg, nemlig — and **Coop**, via Kvickly, SuperBrugsen and
+365discount. One query per product on the list; `sync` only reads the cache.
+
+Offers carry no barcode, so they are matched on **name** — the technique
+rejected for shelf prices two sections down. It is allowed here because:
+
+- **The threshold is high enough to say no.** 6 of 372 REMA campaigns matched
+  a product, and all 6 were correct. The earlier failure came from always
+  taking the best of 3844 candidates, which can never return nothing.
+- **An offer is read, not written.** A wrong shelf price sits invisibly in
+  Grocy; a wrong offer costs a glance and is marked ⚡ as approximate.
+
+Two things that only showed up against live data:
+
+- **Dealers need an allowlist.** Tjek indexes wholesalers and German border
+  shops. "Spagetti" matched AB Catering at 79,00 — a catering pack — and
+  Fleggaard/Poetzsch are in Padborg. `OFFER_DEALERS` is an allowlist so a new
+  wholesaler is ignored by default.
+- **A third of results are Norwegian.** The same endpoint serves Norway, so
+  offers are filtered on `currency == "DKK"` — not on dealer name, since
+  "Netto" exists in both countries.
+
+Expired offers are dropped at render time: a tilbud that ended is worse than no
+tilbud, because it sends you to the shop for a price that is gone.
 
 ### Why there is no name matching here
 
